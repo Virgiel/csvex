@@ -1,0 +1,23 @@
+[package]
+name = "csvex"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Efficient allocator
+mimalloc = { version = "0.1", default-features = false }
+# Terminal UI
+tui = { path = "../tui" } #git = "https://github.com/Virgiel/tui" }
+# CSV parser
+csv = "1.1.6"
+csv-core = "0.1.10"
+# Conventional UTF-8 string
+bstr = "1.0.1"
+# Efficient locks
+parking_lot = "0.12.1"
+
+# Optimal size and perf
+[profile.release]
+opt-level = 3
+lto = "thin"
+panic = "abort"
