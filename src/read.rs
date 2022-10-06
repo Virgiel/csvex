@@ -156,14 +156,11 @@ impl Config {
 
 mod sniffing {
     use std::{
-        borrow::Cow,
         fs::File,
         io::{self, BufRead, BufReader},
     };
 
-    use bstr::ByteSlice;
-
-    use crate::read::NestedString;
+    use crate::{fmt::Ty, read::NestedString};
 
     use super::CsvReader;
 
@@ -198,23 +195,6 @@ mod sniffing {
             .unwrap_or(DELIMITER[0]))
     }
 
-    #[derive(PartialEq, Eq)]
-    enum TY {
-        String,
-        Number,
-        Bool,
-    }
-
-    fn sniff_ty<'a>(str: Cow<'a, str>) -> TY {
-        if str.parse::<bool>().is_ok() {
-            TY::Bool
-        } else if str.parse::<f64>().is_ok() {
-            TY::Number
-        } else {
-            TY::String
-        }
-    }
-
     /// Guess the csv delimiter from the first line
     pub fn sniff_has_header(rdr: &mut CsvReader) -> io::Result<bool> {
         let mut row = NestedString::new();
@@ -225,16 +205,16 @@ mod sniffing {
             if field.is_empty() {
                 return Ok(false);
             }
-            tys.push(sniff_ty(field.to_str_lossy()));
+            tys.push(Ty::guess(field));
         }
 
-        let all_str = tys.iter().all(|t| *t == TY::String);
+        let all_str = tys.iter().all(|b| b.is_str());
         rdr.record(&mut row)?; // Read first supposed data
         let mut all_same = true;
         for (i, field) in row.iter().enumerate() {
-            let ty = sniff_ty(field.to_str_lossy());
+            let ty = Ty::guess(field);
             // typical headers are all string and a data column are not
-            if all_str && ty != TY::String {
+            if all_str && !ty.is_str() {
                 return Ok(true);
             }
 

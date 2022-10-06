@@ -8,6 +8,7 @@ use std::{
 
 use bstr::{BStr, ByteSlice};
 use csv_core::ReadRecordResult;
+use fmt::{ColSpacing, FmtBuffer, Ty};
 use parking_lot::Mutex;
 use read::{Config, CsvReader, NestedString};
 use spinner::Spinner;
@@ -104,6 +105,7 @@ struct App {
     col_off: usize,
     index: Indexer,
     spinner: Spinner,
+    fmt_buff: FmtBuffer,
     dirty: bool,
 }
 
@@ -120,6 +122,7 @@ impl App {
             row_off: 0,
             col_off: 0,
             spinner: Spinner::new(),
+            fmt_buff: FmtBuffer::new(),
             dirty: false,
         })
     }
@@ -170,6 +173,7 @@ impl App {
             spinner,
             config,
             col_off,
+            fmt_buff,
             ..
         } = self;
 
@@ -196,7 +200,12 @@ impl App {
                     .iter()
                     .map(|n| (0, n))
                     .chain(rows.iter().map(|(i, n)| (*i + 1, n)))
-                    .map(|(i, n)| (i, n.iter().skip(*col_off).collect()))
+                    .map(|(i, n)| {
+                        (
+                            i,
+                            n.iter().skip(*col_off).map(|s| (Ty::guess(s), s)).collect(),
+                        )
+                    })
                     .collect();
 
                 // Compute padding
@@ -207,10 +216,16 @@ impl App {
                 let max = rows.iter().map(|(_, n)| n.len()).max().unwrap_or(0);
                 let col_pad: Vec<_> = (0..max)
                     .map(|i| {
-                        rows.iter()
-                            .map(|(_, n)| n.get(i).map(|it| it.width()).unwrap_or(0))
-                            .max()
-                            .unwrap_or(0)
+                        rows.iter().fold(ColSpacing::new(), |mut space, (l, n)| {
+                            n.get(i).map(|(ty, s)| {
+                                if *l == 0 {
+                                    space.header(s)
+                                } else {
+                                    space.add(fmt_buff, ty, s)
+                                }
+                            });
+                            space
+                        })
                     })
                     .collect();
 
@@ -227,15 +242,15 @@ impl App {
                 if let Some(char) = spinner.state(is_loading) {
                     l.rdraw(char, none().fg(Color::Green));
                 }
-                l.rdraw(fmt::quantity(nb_row), none());
+                l.rdraw(fmt::quantity(fmt_buff, nb_row), none());
                 l.rdraw(':', grey());
-                l.rdraw(fmt::quantity(*row_off + 1), none());
+                l.rdraw(fmt::quantity(fmt_buff, *row_off + 1), none());
                 l.rdraw(' ', none());
                 l.draw(&config.path, none().fg(Color::Green));
 
                 // Draw rows bar
                 for (l, n) in rows.into_iter() {
-                    let mut line = c.top();
+                    let line = &mut c.top();
                     let style = if l == 0 {
                         line.draw(
                             format_args!("{:<1$} ", '#', idx_pad),
@@ -252,12 +267,12 @@ impl App {
 
                     let mut cols = col_pad.iter().enumerate();
                     while line.width() > 0 {
-                        if let Some((i, pad)) = cols.next() {
-                            let content = n
-                                .get(i)
-                                .map(|it| *it)
-                                .unwrap_or_else(|| BStr::new(if l == 0 { "?" } else { "" }));
-                            line.draw(format_args!("{content:<0$} ", pad), style);
+                        if let Some((i, space)) = cols.next() {
+                            let (ty, s) = n.get(i).map(|it| *it).unwrap_or_else(|| {
+                                (Ty::Str, BStr::new(if l == 0 { "?" } else { "" }))
+                            });
+                            ty.fmt(line, s, space.budget(), space, fmt_buff, style, l == 0);
+                            line.draw(' ', none());
                         } else {
                             break;
                         }
@@ -275,7 +290,7 @@ trait BStrWidth {
 impl BStrWidth for BStr {
     fn width(&self) -> usize {
         self.chars()
-            .map(|c| c.width_cjk().unwrap_or(0))
+            .map(|c| c.width().unwrap_or(0))
             .fold(0, Add::add)
     }
 }

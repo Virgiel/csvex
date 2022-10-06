@@ -1,10 +1,10 @@
-Southborough:MA:United States:9686
-Northbridge:MA:United States:14061
-Westborough:MA:  United States:29313
-Marlborough: MA:United States :38334
-Springfield:MA:United States:152227
-Springfield:MO: United States    :150443:
-Springfield:NJ:United States:14976
-Springfield:OH:United States:64325
-Springfield:OR:United States:56032:45: 34
-Concord:NH:United States:42605
+Southborough:MA:United States:fmt:9686
+Northbridge:MA:United States:12345:14061
+Westborough:MA:  United States:1234.:29313
+Marlborough: MA:United States :123:38334
+Springfield:MA:United States:12.3:152227
+Springfield:MO: United States    :1.23:150443:
+Springfield:NJ:United States:0.123:14976
+Springfield:OH:United States:0.0123:64325
+Springfield:OR:United States:-inf:56032:45: 34
+Concord:NH:United States:NA:42605

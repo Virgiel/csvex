@@ -15,6 +15,8 @@ csv-core = "0.1.10"
 bstr = "1.0.1"
 # Efficient locks
 parking_lot = "0.12.1"
+# Precise decimal
+rust_decimal = { version = "1.26.1", default-features = false }
 
 # Optimal size and perf
 [profile.release]
