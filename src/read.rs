@@ -96,12 +96,12 @@ impl NestedString {
 
     /// Lazily trimmed and escaped str field
 
-    fn get_str_trim<'a>(&'a self, start: usize, end: usize) -> &BStr {
+    fn get_str_trim(&self, start: usize, end: usize) -> &BStr {
         BStr::new(BStr::new(&self.buff[start..end]).trim())
     }
 
     /// Lazily trimmed and escaped str field
-    pub fn get<'a>(&'a self, idx: usize) -> Option<&BStr> {
+    pub fn get(&self, idx: usize) -> Option<&BStr> {
         (idx < self.len()).then(|| self.get_str_trim(self.bounds[idx], self.bounds[idx + 1]))
     }
 

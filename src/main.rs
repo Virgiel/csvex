@@ -8,7 +8,7 @@ use std::{
 
 use bstr::{BStr, ByteSlice};
 use csv_core::ReadRecordResult;
-use fmt::{rtrim, ColStat, Field, FmtBuffer, Ty};
+use fmt::{fmt_field, rtrim, ColStat, FmtBuffer, Ty};
 use parking_lot::Mutex;
 use read::{Config, CsvReader, NestedString};
 use spinner::Spinner;
@@ -65,7 +65,7 @@ impl FileWatcher {
 fn main() {
     let path = std::env::args().nth(1).unwrap();
     let mut app = App::open(path.clone()).unwrap();
-    let mut watcher = FileWatcher::new(path.clone()).unwrap();
+    let mut watcher = FileWatcher::new(path).unwrap();
     let mut redraw = true;
     loop {
         // Check loading state before drawing to no skip completed task during drawing
@@ -289,13 +289,15 @@ impl App {
                                 (Vec::new(), ColStat::new()),
                                 |(mut vec, mut stat), content| {
                                     let ty = Ty::guess(content);
-                                    stat.add(&ty, &content);
+                                    stat.add(&ty, content);
                                     vec.push((ty, content));
                                     (vec, stat)
                                 },
                             );
                         if let Some(headers) = &index.headers {
-                            stat.header_name(headers.get(offset).unwrap_or(&BStr::new("?")));
+                            stat.header_name(
+                                headers.get(offset).unwrap_or_else(|| BStr::new("?")),
+                            );
                         } else {
                             stat.header_idx(offset + 1);
                         }
@@ -342,7 +344,7 @@ impl App {
                         none().fg(Color::Blue).bold()
                     };
                     let header = if let Some(header) = &index.headers {
-                        let name = header.get(*i).unwrap_or(BStr::new("?"));
+                        let name = header.get(*i).unwrap_or_else(|| BStr::new("?"));
                         rtrim(name, fmt_buff, *budget)
                     } else {
                         rtrim(*i + 1, fmt_buff, *budget)
@@ -361,11 +363,7 @@ impl App {
                     for (_, fields, stat, budget) in &cols {
                         let (ty, str) = fields[i];
                         line.draw(
-                            format_args!(
-                                "{:<1$} ",
-                                rtrim(Field::new(&ty, str, &stat), fmt_buff, *budget),
-                                budget
-                            ),
+                            format_args!("{} ", fmt_field(fmt_buff, &ty, str, stat, *budget)),
                             style,
                         );
                     }
