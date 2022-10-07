@@ -8,7 +8,7 @@ use std::{
 
 use bstr::{BStr, ByteSlice};
 use csv_core::ReadRecordResult;
-use fmt::{ColSpacing, FmtBuffer, Ty};
+use fmt::{rtrim, ColStat, Field, FmtBuffer, Ty};
 use parking_lot::Mutex;
 use read::{Config, CsvReader, NestedString};
 use spinner::Spinner;
@@ -96,13 +96,97 @@ fn main() {
     }
 }
 
+struct Nav {
+    // Offset position
+    o_row: usize,
+    // Cursor positions
+    c_row: usize,
+    c_col: usize,
+    // View dimension
+    v_row: usize,
+    v_col: usize,
+}
+
+impl Nav {
+    pub fn new() -> Self {
+        Self {
+            o_row: 0,
+            c_row: 0,
+            c_col: 0,
+            v_row: 0,
+            v_col: 0,
+        }
+    }
+
+    pub fn up(&mut self) {
+        self.c_row = self.c_row.saturating_sub(1);
+    }
+
+    pub fn down(&mut self) {
+        self.c_row = self.c_row.saturating_add(1);
+    }
+
+    pub fn left(&mut self) {
+        self.c_col = self.c_col.saturating_sub(1);
+    }
+
+    pub fn right(&mut self) {
+        self.c_col = self.c_col.saturating_add(1);
+    }
+
+    pub fn row_offset(&mut self, total: usize, nb: usize) -> usize {
+        // Sync view dimension
+        self.v_row = nb;
+        // Ensure cursor pos fit in grid dimension
+        self.c_row = self.c_row.min(total.saturating_sub(1));
+        // Ensure cursor is in view
+        if self.c_row < self.o_row {
+            self.o_row = self.c_row;
+        } else if self.c_row >= self.o_row + nb {
+            self.o_row = self.c_row - nb + 1;
+        }
+        self.o_row
+    }
+
+    pub fn col_iter(&mut self, total: usize) -> impl Iterator<Item = usize> + '_ {
+        // Ensure cursor pos fit in grid dimension
+        self.c_col = self.c_col.min(total.saturating_sub(1));
+        // Reset view dimension
+        self.v_col = 0;
+
+        // Amount of column on the right
+        let amount_right = total - self.c_col;
+        // Coll offset iterator
+        std::iter::from_fn(move || -> Option<usize> {
+            if self.v_col < total {
+                let step = self.v_col;
+                self.v_col += 1;
+                Some(if step < amount_right {
+                    self.c_col + step
+                } else {
+                    self.c_col - (step - amount_right) - 1
+                })
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn cursor_row(&self) -> usize {
+        self.c_row
+    }
+
+    pub fn cursor_col(&self) -> usize {
+        self.c_col
+    }
+}
+
 struct App {
     terminal: Terminal,
     config: Config,
     rdr: CsvReader,
     grid: Grid,
-    row_off: usize,
-    col_off: usize,
+    nav: Nav,
     index: Indexer,
     spinner: Spinner,
     fmt_buff: FmtBuffer,
@@ -119,8 +203,7 @@ impl App {
             config,
             index,
             grid: Grid::new(),
-            row_off: 0,
-            col_off: 0,
+            nav: Nav::new(),
             spinner: Spinner::new(),
             fmt_buff: FmtBuffer::new(),
             dirty: false,
@@ -153,10 +236,10 @@ impl App {
                 _ => {}
             }
             match event.code {
-                KeyCode::Down | KeyCode::Char('j') => self.row_off += 1,
-                KeyCode::Up | KeyCode::Char('k') => self.row_off = self.row_off.saturating_sub(1),
-                KeyCode::Right | KeyCode::Char('l') => self.col_off += 1,
-                KeyCode::Left | KeyCode::Char('h') => self.col_off = self.col_off.saturating_sub(1),
+                KeyCode::Left | KeyCode::Char('h') => self.nav.left(),
+                KeyCode::Down | KeyCode::Char('j') => self.nav.down(),
+                KeyCode::Up | KeyCode::Char('k') => self.nav.up(),
+                KeyCode::Right | KeyCode::Char('l') => self.nav.right(),
                 _ => {}
             }
         }
@@ -168,11 +251,10 @@ impl App {
             terminal,
             rdr,
             grid,
-            row_off,
+            nav,
             index,
             spinner,
             config,
-            col_off,
             fmt_buff,
             ..
         } = self;
@@ -181,10 +263,11 @@ impl App {
             .draw(|c| {
                 // Sync state with indexer
                 let nb_row = index.nb_row();
-                *row_off = nb_row.min(*row_off);
                 let is_loading = index.is_loading();
                 // Get rows content
-                let offsets = index.get_offsets(*row_off..*row_off + c.height().saturating_sub(1));
+                let nb_draw_row = c.height().saturating_sub(2);
+                let row_off = nav.row_offset(nb_row, nb_draw_row);
+                let offsets = index.get_offsets(row_off..row_off + nb_draw_row);
                 grid.read_rows(&offsets, rdr).unwrap();
                 let rows = grid.rows();
                 let nb_col = rows
@@ -194,40 +277,37 @@ impl App {
                     .map(|n| n.len())
                     .max()
                     .unwrap_or(0);
-                *col_off = nb_col.min(*col_off);
-                let rows: Vec<(usize, Vec<_>)> = index
-                    .headers
-                    .iter()
-                    .map(|n| (0, n))
-                    .chain(rows.iter().map(|(i, n)| (*i + 1, n)))
-                    .map(|(i, n)| {
-                        (
-                            i,
-                            n.iter().skip(*col_off).map(|s| (Ty::guess(s), s)).collect(),
-                        )
-                    })
-                    .collect();
-
-                // Compute padding
-                let idx_pad = rows
-                    .last()
-                    .map(|(i, _)| (*i as f64).log10() as usize + 1)
-                    .unwrap_or(1);
-                let max = rows.iter().map(|(_, n)| n.len()).max().unwrap_or(0);
-                let col_pad: Vec<_> = (0..max)
-                    .map(|i| {
-                        rows.iter().fold(ColSpacing::new(), |mut space, (l, n)| {
-                            n.get(i).map(|(ty, s)| {
-                                if *l == 0 {
-                                    space.header(s)
-                                } else {
-                                    space.add(fmt_buff, ty, s)
-                                }
-                            });
-                            space
-                        })
-                    })
-                    .collect();
+                let mut col_offset_iter = nav.col_iter(nb_col);
+                let mut remaining_width = c.width();
+                let mut cols = Vec::new();
+                while remaining_width > cols.len() {
+                    if let Some(offset) = col_offset_iter.next() {
+                        let (fields, mut stat) = rows
+                            .iter()
+                            .map(|(_, n)| n.get(offset).unwrap_or_default())
+                            .fold(
+                                (Vec::new(), ColStat::new()),
+                                |(mut vec, mut stat), content| {
+                                    let ty = Ty::guess(content);
+                                    stat.add(&ty, &content);
+                                    vec.push((ty, content));
+                                    (vec, stat)
+                                },
+                            );
+                        if let Some(headers) = &index.headers {
+                            stat.header_name(headers.get(offset).unwrap_or(&BStr::new("?")));
+                        } else {
+                            stat.header_idx(offset + 1);
+                        }
+                        let allowed = stat.budget().min(remaining_width - cols.len());
+                        remaining_width = remaining_width.saturating_sub(allowed);
+                        cols.push((offset, fields, stat, allowed));
+                    } else {
+                        break;
+                    }
+                }
+                cols.sort_unstable_by_key(|(i, _, _, _)| *i); // Find a way to store col in order
+                drop(col_offset_iter);
 
                 // Draw error bar
                 if self.dirty {
@@ -244,38 +324,50 @@ impl App {
                 }
                 l.rdraw(fmt::quantity(fmt_buff, nb_row), none());
                 l.rdraw(':', grey());
-                l.rdraw(fmt::quantity(fmt_buff, *row_off + 1), none());
+                l.rdraw(fmt::quantity(fmt_buff, nb_col), none());
+                l.rdraw('|', grey());
+                l.rdraw(fmt::quantity(fmt_buff, nav.cursor_row() + 1), none());
+                l.rdraw(':', grey());
+                l.rdraw(fmt::quantity(fmt_buff, nav.cursor_col() + 1), none());
                 l.rdraw(' ', none());
                 l.draw(&config.path, none().fg(Color::Green));
 
-                // Draw rows bar
-                for (l, n) in rows.into_iter() {
-                    let line = &mut c.top();
-                    let style = if l == 0 {
-                        line.draw(
-                            format_args!("{:<1$} ", '#', idx_pad),
-                            none().fg(Color::DarkGrey).bold(),
-                        );
-                        none().fg(Color::Blue).bold()
+                // Draw headers
+
+                let line = &mut c.top();
+                for (i, _, _, budget) in &cols {
+                    let style = if *i == nav.cursor_col() {
+                        none().fg(Color::Yellow).bold()
                     } else {
-                        line.draw(
-                            format_args!("{:<1$} ", l, idx_pad),
-                            none().fg(Color::DarkGrey),
-                        );
+                        none().fg(Color::Blue).bold()
+                    };
+                    let header = if let Some(header) = &index.headers {
+                        let name = header.get(*i).unwrap_or(BStr::new("?"));
+                        rtrim(name, fmt_buff, *budget)
+                    } else {
+                        rtrim(*i + 1, fmt_buff, *budget)
+                    };
+                    line.draw(format_args!("{header:<0$} ", budget), style);
+                }
+
+                // Draw rows
+                for (i, (e, _)) in rows.iter().enumerate() {
+                    let style = if *e == nav.cursor_row() {
+                        none().fg(Color::Yellow)
+                    } else {
                         none()
                     };
-
-                    let mut cols = col_pad.iter().enumerate();
-                    while line.width() > 0 {
-                        if let Some((i, space)) = cols.next() {
-                            let (ty, s) = n.get(i).map(|it| *it).unwrap_or_else(|| {
-                                (Ty::Str, BStr::new(if l == 0 { "?" } else { "" }))
-                            });
-                            ty.fmt(line, s, space.budget(), space, fmt_buff, style, l == 0);
-                            line.draw(' ', none());
-                        } else {
-                            break;
-                        }
+                    let line = &mut c.top();
+                    for (_, fields, stat, budget) in &cols {
+                        let (ty, str) = fields[i];
+                        line.draw(
+                            format_args!(
+                                "{:<1$} ",
+                                rtrim(Field::new(&ty, str, &stat), fmt_buff, *budget),
+                                budget
+                            ),
+                            style,
+                        );
                     }
                 }
             })

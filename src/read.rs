@@ -200,10 +200,16 @@ mod sniffing {
         let mut row = NestedString::new();
         rdr.record(&mut row)?; // Read headers
         let mut tys = Vec::with_capacity(row.len());
+        let mut found_empty = false;
         for field in row.iter() {
-            // header should not be empty
             if field.is_empty() {
-                return Ok(false);
+                if !found_empty {
+                    // Last row can be a fake one
+                    found_empty = true;
+                } else {
+                    // header should not be empty
+                    return Ok(false);
+                }
             }
             tys.push(Ty::guess(field));
         }
@@ -229,6 +235,6 @@ mod sniffing {
         }
 
         // default CSV commonly have headers
-        Ok(true)
+        Ok(false)
     }
 }
