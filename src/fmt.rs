@@ -1,9 +1,6 @@
-use bstr::{BStr, ByteSlice};
 use rust_decimal::Decimal;
 use std::fmt::{Display, Write as is_empty};
 use tui::unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
-use crate::BStrWidth;
 
 /// Buffer used by fmt functions
 pub type FmtBuffer = String;
@@ -27,23 +24,21 @@ pub enum Ty {
 }
 
 impl Ty {
-    pub fn guess(s: &BStr) -> Ty {
+    pub fn guess(s: &str) -> Ty {
         let s = s.trim();
         if s.is_empty() {
             Ty::Str
-        } else if let Ok(str) = s.to_str() {
-            if str.parse::<Decimal>().is_ok() {
-                let lhs = str.find('.').unwrap_or(str.len()); // Everything before .
-                let rhs = str.len() - lhs;
+        } else {
+            if s.parse::<Decimal>().is_ok() {
+                let lhs = s.find('.').unwrap_or(s.len()); // Everything before .
+                let rhs = s.len() - lhs;
                 Ty::Nb { rhs, lhs }
             } else {
-                match str {
+                match s {
                     "true" | "True" | "TRUE" | "false" | "False" | "FALSE" => Ty::Bool,
                     _ => Ty::Str,
                 }
             }
-        } else {
-            Ty::Str
         }
     }
 
@@ -71,7 +66,7 @@ impl ColStat {
         }
     }
 
-    pub fn header_name(&mut self, s: &BStr) {
+    pub fn header_name(&mut self, s: &str) {
         self.header_len = s.width();
     }
 
@@ -79,7 +74,7 @@ impl ColStat {
         self.header_len = (i as f64).log10() as usize + 1;
     }
 
-    pub fn add(&mut self, ty: &Ty, s: &BStr) {
+    pub fn add(&mut self, ty: &Ty, s: &str) {
         self.only_str &= ty.is_str();
         match ty {
             Ty::Bool => self.max_lhs = self.max_lhs.max(5),
@@ -105,7 +100,7 @@ impl ColStat {
 pub fn fmt_field<'a>(
     buff: &'a mut FmtBuffer,
     ty: &Ty,
-    str: &BStr,
+    str: &str,
     stat: &ColStat,
     budget: usize,
 ) -> &'a str {

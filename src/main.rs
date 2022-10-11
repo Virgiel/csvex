@@ -1,23 +1,19 @@
 use std::{
     io::{self, BufRead, Seek},
-    ops::Add,
     sync::Arc,
     thread,
     time::{Duration, Instant, SystemTime},
 };
 
-use bstr::{BStr, ByteSlice};
 use csv_core::ReadRecordResult;
 use fmt::{fmt_field, rtrim, ColStat, FmtBuffer, Ty};
 use parking_lot::Mutex;
-use read::{Config, CsvReader, NestedString};
+use read::{BytesRecord, Config, CsvReader, StringRecord};
 use spinner::Spinner;
 use style::grey;
 use tui::{
     crossterm::event::{self, Event, KeyCode},
-    none,
-    unicode_width::UnicodeWidthChar,
-    Color, Terminal,
+    none, Color, Terminal,
 };
 
 mod fmt;
@@ -295,9 +291,7 @@ impl App {
                                 },
                             );
                         if let Some(headers) = &index.headers {
-                            stat.header_name(
-                                headers.get(offset).unwrap_or_else(|| BStr::new("?")),
-                            );
+                            stat.header_name(headers.get(offset).unwrap_or_else(|| "?"));
                         } else {
                             stat.header_idx(offset + 1);
                         }
@@ -344,7 +338,7 @@ impl App {
                         none().fg(Color::Blue).bold()
                     };
                     let header = if let Some(header) = &index.headers {
-                        let name = header.get(*i).unwrap_or_else(|| BStr::new("?"));
+                        let name = header.get(*i).unwrap_or_else(|| "?");
                         rtrim(name, fmt_buff, *budget)
                     } else {
                         rtrim(*i + 1, fmt_buff, *budget)
@@ -373,21 +367,9 @@ impl App {
     }
 }
 
-trait BStrWidth {
-    fn width(&self) -> usize;
-}
-
-impl BStrWidth for BStr {
-    fn width(&self) -> usize {
-        self.chars()
-            .map(|c| c.width().unwrap_or(0))
-            .fold(0, Add::add)
-    }
-}
-
 struct Grid {
     /// Rows metadata
-    rows: Vec<(usize, NestedString)>,
+    rows: Vec<(usize, StringRecord)>,
     /// Number of fresh rows
     len: usize,
 }
@@ -410,7 +392,7 @@ impl Grid {
 
     fn read_row(&mut self, line: usize, offset: u64, rdr: &mut CsvReader) -> io::Result<()> {
         if self.len == self.rows.len() {
-            let mut nested = NestedString::new();
+            let mut nested = StringRecord::new();
             rdr.record_at(&mut nested, offset)?;
             self.rows.push((line, nested));
         } else if let Some(pos) = self.rows.iter().position(|(l, _)| *l == line) {
@@ -424,7 +406,7 @@ impl Grid {
         Ok(())
     }
 
-    pub fn rows(&self) -> &[(usize, NestedString)] {
+    pub fn rows(&self) -> &[(usize, StringRecord)] {
         &self.rows[..self.len]
     }
 }
@@ -434,7 +416,7 @@ struct IndexerState {
 }
 
 pub struct Indexer {
-    pub headers: Option<NestedString>,
+    pub headers: Option<StringRecord>,
     task: Arc<Mutex<IndexerState>>,
     // TODO show error
 }
@@ -443,7 +425,7 @@ impl Indexer {
     pub fn index(config: &Config) -> io::Result<Self> {
         let mut rdr = config.reader()?;
         let headers = if config.has_header {
-            let mut nested = NestedString::new();
+            let mut nested = StringRecord::new();
             rdr.record(&mut nested)?;
             Some(nested)
         } else {
