@@ -35,7 +35,7 @@ impl<'r> Engine<'r> {
         )
     }
 
-    fn cmp<T: Eq + Ord>(a: &T, b: &T, op: CmpOp) -> bool {
+    fn cmp<T: Eq + Ord>(a: T, b: T, op: CmpOp) -> bool {
         match op {
             CmpOp::Eq => a == b,
             CmpOp::Ne => a != b,
@@ -54,16 +54,16 @@ impl<'r> Engine<'r> {
                 } else {
                     let mut buff = [0; 32];
                     let nb = in_place_str(&mut buff, nb);
-                    Self::cmp(&str, &BStr::new(nb), op)
+                    Self::cmp(str, BStr::new(nb), op)
                 }
             }
-            Value::Str(value) => Self::cmp(
-                &str.as_ref(),
-                &self.filter.source[value.clone()]
+            Value::Str(value) => {
+                let str = str.as_ref();
+                let value = self.filter.source[value.clone()]
                     .as_bytes()
-                    .trim_with(|c| c == '"'),
-                op,
-            ),
+                    .trim_with(|c| c == '"');
+                Self::cmp(str, value, op)
+            }
         }
     }
 
@@ -116,6 +116,10 @@ impl<'r> Engine<'r> {
     }
 
     pub fn check(&self, record: &NestedString) -> bool {
-        self.run_node(record, self.filter.start)
+        if self.filter.source.is_empty() {
+            true
+        } else {
+            self.run_node(record, self.filter.start)
+        }
     }
 }

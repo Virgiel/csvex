@@ -1,5 +1,5 @@
 use std::{
-    io::{self, BufRead, Seek},
+    io::{self, Seek},
     ops::Add,
     sync::Arc,
     thread,
@@ -7,7 +7,6 @@ use std::{
 };
 
 use bstr::{BStr, ByteSlice};
-use csv_core::ReadRecordResult;
 use filter::{Engine, Filter, Highlighter, Style};
 use fmt::{fmt_field, rtrim, ColStat, FmtBuffer, Ty};
 use parking_lot::Mutex;
@@ -65,7 +64,9 @@ impl FileWatcher {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or("test.csv".to_string());
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or("../../Downloads/adresses-france.csv".to_string());
     let mut app = App::open(path.clone()).unwrap();
     let mut watcher = FileWatcher::new(path).unwrap();
     let mut redraw = true;
@@ -101,6 +102,7 @@ fn main() {
 struct Nav {
     // Offset position
     o_row: usize,
+    o_col: usize,
     // Cursor positions
     c_row: usize,
     c_col: usize,
@@ -113,6 +115,7 @@ impl Nav {
     pub fn new() -> Self {
         Self {
             o_row: 0,
+            o_col: 0,
             c_row: 0,
             c_col: 0,
             v_row: 0,
@@ -156,18 +159,30 @@ impl Nav {
         // Reset view dimension
         self.v_col = 0;
 
-        // Amount of column on the right
         let amount_right = total - self.c_col;
+        let goal_left = self.c_col.saturating_sub(self.o_col);
+
         // Coll offset iterator
         std::iter::from_fn(move || -> Option<usize> {
             if self.v_col < total {
                 let step = self.v_col;
                 self.v_col += 1;
-                Some(if step < amount_right {
-                    self.c_col + step
+                let result = if step <= goal_left {
+                    // Reach goal
+                    self.c_col - step
+                } else if step < goal_left + amount_right {
+                    // Then fill right
+                    self.c_col + (step - goal_left)
                 } else {
-                    self.c_col - (step - amount_right) - 1
-                })
+                    // Then fill left
+                    self.c_col - (step - goal_left - amount_right)
+                };
+                if result < self.o_col {
+                    self.o_col = result;
+                } else if result > self.o_col + step {
+                    self.o_col = result - step;
+                }
+                Some(result)
             } else {
                 None
             }
@@ -175,7 +190,7 @@ impl Nav {
     }
 
     pub fn cursor_row(&self) -> usize {
-        self.c_row
+        self.c_row - self.o_row
     }
 
     pub fn cursor_col(&self) -> usize {
@@ -245,20 +260,14 @@ impl App {
                             self.index = Indexer::index(&self.config, Filter::empty()).unwrap()
                         }
                     }
-                    KeyCode::Char(c) => {
-                        filter.push(c);
-                        match Filter::new(filter.clone()) {
-                            Ok(it) => self.index = Indexer::index(&self.config, it).unwrap(),
-                            Err((pos, msg)) => self.err = format!("at {pos:?}: {msg}"),
-                        }
-                    }
+                    KeyCode::Char(c) => filter.push(c),
                     KeyCode::Backspace => {
                         filter.pop();
-                        match Filter::new(filter.clone()) {
-                            Ok(it) => self.index = Indexer::index(&self.config, it).unwrap(),
-                            Err((pos, msg)) => self.err = format!("at {pos:?}: {msg}"),
-                        }
                     }
+                    KeyCode::Enter => match Filter::new(filter.clone()) {
+                        Ok(it) => self.index = Indexer::index(&self.config, it).unwrap(),
+                        Err((pos, msg)) => self.err = format!("at {pos:?}: {msg}"),
+                    },
                     _ => {}
                 },
                 None => {
@@ -323,8 +332,12 @@ impl App {
                     .map(|n| n.len())
                     .max()
                     .unwrap_or(0);
+                let id_len = rows
+                    .last()
+                    .map(|(i, _)| (*i as f32).log10() as usize + 1)
+                    .unwrap_or(1);
                 let mut col_offset_iter = nav.col_iter(nb_col);
-                let mut remaining_width = c.width();
+                let mut remaining_width = c.width() - id_len as usize - 1;
                 let mut cols = Vec::new();
                 while remaining_width > cols.len() {
                     if let Some(offset) = col_offset_iter.next() {
@@ -387,7 +400,7 @@ impl App {
                     l.rdraw(':', grey());
                     l.rdraw(fmt::quantity(fmt_buff, nb_col), none());
                     l.rdraw('|', grey());
-                    l.rdraw(fmt::quantity(fmt_buff, nav.cursor_row() + 1), none());
+                    l.rdraw(fmt::quantity(fmt_buff, nav.o_row + 1), none());
                     l.rdraw(':', grey());
                     l.rdraw(fmt::quantity(fmt_buff, nav.cursor_col() + 1), none());
                     l.rdraw(' ', none());
@@ -395,30 +408,41 @@ impl App {
                 }
 
                 // Draw headers
-                let line = &mut c.top();
-                for (i, _, _, budget) in &cols {
-                    let style = if *i == nav.cursor_col() {
-                        none().fg(Color::Yellow).bold()
-                    } else {
-                        none().fg(Color::Blue).bold()
-                    };
-                    let header = if let Some(header) = &index.headers {
-                        let name = header.get(*i).unwrap_or_else(|| BStr::new("?"));
-                        rtrim(name, fmt_buff, *budget)
-                    } else {
-                        rtrim(*i + 1, fmt_buff, *budget)
-                    };
-                    line.draw(format_args!("{header:<0$} ", budget), style);
+                {
+                    let line = &mut c.top();
+                    line.draw(
+                        format_args!("{:>1$} ", '#', id_len),
+                        none().fg(Color::DarkGrey).bold(),
+                    );
+
+                    for (i, _, _, budget) in &cols {
+                        let header = if let Some(header) = &index.headers {
+                            let name = header.get(*i).unwrap_or_else(|| BStr::new("?"));
+                            rtrim(name, fmt_buff, *budget)
+                        } else {
+                            rtrim(*i + 1, fmt_buff, *budget)
+                        };
+                        let style = if *i == nav.cursor_col() {
+                            style::reverse(none().bold())
+                        } else {
+                            none().bold()
+                        };
+                        line.draw(format_args!("{header:<0$} ", budget), style);
+                    }
                 }
 
                 // Draw rows
                 for (i, (e, _)) in rows.iter().enumerate() {
-                    let style = if *e == nav.cursor_row() {
-                        none().fg(Color::Yellow)
+                    let style = if i == nav.cursor_row() {
+                        style::reverse(none())
                     } else {
                         none()
                     };
                     let line = &mut c.top();
+                    line.draw(
+                        format_args!("{:>1$} ", *e, id_len),
+                        none().fg(Color::DarkGrey),
+                    );
                     for (_, fields, stat, budget) in &cols {
                         let (ty, str) = fields[i];
                         line.draw(
@@ -434,7 +458,7 @@ impl App {
 
 struct Grid {
     /// Rows metadata
-    rows: Vec<(usize, NestedString)>,
+    rows: Vec<(u32, NestedString)>,
     /// Number of fresh rows
     len: usize,
 }
@@ -447,7 +471,7 @@ impl Grid {
         }
     }
 
-    pub fn read_rows(&mut self, rows: &[(usize, u64)], rdr: &mut CsvReader) -> io::Result<()> {
+    pub fn read_rows(&mut self, rows: &[(u32, u64)], rdr: &mut CsvReader) -> io::Result<()> {
         self.len = 0;
         for (row, offset) in rows {
             self.read_row(*row, *offset, rdr)?;
@@ -455,7 +479,7 @@ impl Grid {
         Ok(())
     }
 
-    fn read_row(&mut self, line: usize, offset: u64, rdr: &mut CsvReader) -> io::Result<()> {
+    fn read_row(&mut self, line: u32, offset: u64, rdr: &mut CsvReader) -> io::Result<()> {
         if self.len == self.rows.len() {
             let mut nested = NestedString::new();
             rdr.record_at(&mut nested, offset)?;
@@ -471,13 +495,13 @@ impl Grid {
         Ok(())
     }
 
-    pub fn rows(&self) -> &[(usize, NestedString)] {
+    pub fn rows(&self) -> &[(u32, NestedString)] {
         &self.rows[..self.len]
     }
 }
 
 struct IndexerState {
-    index: Vec<u64>,
+    index: Vec<(u32, u64)>,
 }
 
 pub struct Indexer {
@@ -515,61 +539,33 @@ impl Indexer {
         filter: Arc<Filter>,
         task: Arc<Mutex<IndexerState>>,
     ) -> io::Result<()> {
-        if !filter.source.is_empty() {
-            // Slower filtering indexer
-            let engine = Engine::new(&filter);
-            let mut record = NestedString::new();
-            let mut pos = rdr.file.stream_position()?;
+        // Slower filtering indexer
+        let engine = Engine::new(&filter);
+        let mut record = NestedString::new();
+        let mut pos = rdr.file.stream_position()?;
+        let mut buff_pos = Vec::with_capacity(100);
 
-            loop {
-                let amount = rdr.record(&mut record)?;
-                pos += amount as u64;
-                if engine.check(&record) {
-                    // If arc is unique this task is canceled
-                    if Arc::strong_count(&task) == 1 {
-                        return Ok(());
-                    }
-                    task.lock().index.push(pos);
-                }
+        let mut count = 0;
+        loop {
+            let amount = rdr.record(&mut record)?;
+            if amount == 0 {
+                break;
+            } else if engine.check(&record) {
+                task.lock().index.push((count, pos));
             }
-        } else {
-            // Very fast line indexer with minimal allocation
-            let (file, rdr) = rdr.inner_mut();
 
-            let mut pos = file.stream_position()?;
-            let mut buff_pos = vec![pos];
+            pos += amount as u64;
+            count += 1;
 
-            // Dummy ignored buffer
-            let mut out = [0; BUF_LEN];
-            let mut bounds = [0; 100];
-
-            loop {
-                let buff = file.fill_buf()?;
-                let (result, amount, _, _) = rdr.read_record(buff, &mut out, &mut bounds);
-                pos += amount as u64;
-                file.consume(amount);
-                match result {
-                    ReadRecordResult::InputEmpty
-                    | ReadRecordResult::OutputFull
-                    | ReadRecordResult::OutputEndsFull => continue, // We ignore outputs
-                    ReadRecordResult::Record => {
-                        // Throttle locking
-                        if buff_pos.len() == 100 {
-                            // If arc is unique this task is canceled
-                            if Arc::strong_count(&task) == 1 {
-                                return Ok(());
-                            }
-                            task.lock().index.append(&mut buff_pos)
-                        }
-                        buff_pos.push(pos);
-                    }
-                    ReadRecordResult::End => break,
+            // Throttle locking
+            if count % 100 == 0 {
+                // If arc is unique this task is canceled
+                if Arc::strong_count(&task) == 1 {
+                    return Ok(());
                 }
-            }
-            buff_pos.pop();
-            {
-                // Finalize state
-                task.lock().index.append(&mut buff_pos);
+                if !buff_pos.is_empty() {
+                    task.lock().index.append(&mut buff_pos);
+                }
             }
         }
 
@@ -587,10 +583,9 @@ impl Indexer {
     }
 
     /// Get offsets of given rows
-    pub fn get_offsets(&self, rows: impl Iterator<Item = usize>) -> Vec<(usize, u64)> {
-        let lock = self.task.lock();
-        rows.map_while(|i| lock.index.get(i).map(|p| (i, *p)))
-            .collect()
+    pub fn get_offsets(&self, rows: impl Iterator<Item = usize>) -> Vec<(u32, u64)> {
+        let locked = self.task.lock();
+        rows.map_while(|i| locked.index.get(i).copied()).collect()
     }
 }
 
