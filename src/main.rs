@@ -1,21 +1,27 @@
 use std::{
     io::{self, BufRead, Seek},
+    ops::Add,
     sync::Arc,
     thread,
     time::{Duration, Instant, SystemTime},
 };
 
+use bstr::{BStr, ByteSlice};
 use csv_core::ReadRecordResult;
+use filter::{Engine, Filter, Highlighter, Style};
 use fmt::{fmt_field, rtrim, ColStat, FmtBuffer, Ty};
 use parking_lot::Mutex;
-use read::{BytesRecord, Config, CsvReader, StringRecord};
+use read::{Config, CsvReader, NestedString};
 use spinner::Spinner;
 use style::grey;
 use tui::{
     crossterm::event::{self, Event, KeyCode},
-    none, Color, Terminal,
+    none,
+    unicode_width::UnicodeWidthChar,
+    Color, Terminal,
 };
 
+mod filter;
 mod fmt;
 mod read;
 mod spinner;
@@ -59,7 +65,7 @@ impl FileWatcher {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).unwrap();
+    let path = std::env::args().nth(1).unwrap_or("test.csv".to_string());
     let mut app = App::open(path.clone()).unwrap();
     let mut watcher = FileWatcher::new(path).unwrap();
     let mut redraw = true;
@@ -187,12 +193,14 @@ struct App {
     spinner: Spinner,
     fmt_buff: FmtBuffer,
     dirty: bool,
+    filter: Option<String>,
+    err: String,
 }
 
 impl App {
     pub fn open(path: String) -> io::Result<Self> {
         let (config, rdr) = Config::sniff(path)?;
-        let index = Indexer::index(&config)?;
+        let index = Indexer::index(&config, Filter::empty())?;
         Ok(Self {
             terminal: Terminal::new(io::stdout())?,
             rdr,
@@ -203,6 +211,8 @@ impl App {
             spinner: Spinner::new(),
             fmt_buff: FmtBuffer::new(),
             dirty: false,
+            filter: None,
+            err: String::new(),
         })
     }
 
@@ -212,7 +222,7 @@ impl App {
 
     pub fn refresh(&mut self) {
         let (config, rdr) = Config::sniff(self.config.path.clone()).unwrap();
-        let index = Indexer::index(&config).unwrap();
+        let index = Indexer::index(&config, self.index.filter.clone()).unwrap();
         self.config = config;
         self.rdr = rdr;
         self.index = index;
@@ -226,17 +236,46 @@ impl App {
 
     pub fn on_event(&mut self, event: Event) -> bool {
         if let Event::Key(event) = event {
-            match event.code {
-                KeyCode::Char('q') => return true,
-                KeyCode::Char('r') => self.refresh(),
-                _ => {}
-            }
-            match event.code {
-                KeyCode::Left | KeyCode::Char('h') => self.nav.left(),
-                KeyCode::Down | KeyCode::Char('j') => self.nav.down(),
-                KeyCode::Up | KeyCode::Char('k') => self.nav.up(),
-                KeyCode::Right | KeyCode::Char('l') => self.nav.right(),
-                _ => {}
+            self.err.clear();
+            match &mut self.filter {
+                Some(filter) => match event.code {
+                    KeyCode::Esc => {
+                        self.filter = None;
+                        if !self.index.filter.source.is_empty() {
+                            self.index = Indexer::index(&self.config, Filter::empty()).unwrap()
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        filter.push(c);
+                        match Filter::new(filter.clone()) {
+                            Ok(it) => self.index = Indexer::index(&self.config, it).unwrap(),
+                            Err((pos, msg)) => self.err = format!("at {pos:?}: {msg}"),
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        filter.pop();
+                        match Filter::new(filter.clone()) {
+                            Ok(it) => self.index = Indexer::index(&self.config, it).unwrap(),
+                            Err((pos, msg)) => self.err = format!("at {pos:?}: {msg}"),
+                        }
+                    }
+                    _ => {}
+                },
+                None => {
+                    match event.code {
+                        KeyCode::Char('q') => return true,
+                        KeyCode::Char('r') => self.refresh(),
+                        _ => {}
+                    }
+                    match event.code {
+                        KeyCode::Left | KeyCode::Char('h') => self.nav.left(),
+                        KeyCode::Down | KeyCode::Char('j') => self.nav.down(),
+                        KeyCode::Up | KeyCode::Char('k') => self.nav.up(),
+                        KeyCode::Right | KeyCode::Char('l') => self.nav.right(),
+                        KeyCode::Char('/') => self.filter = Some(String::new()),
+                        _ => {}
+                    }
+                }
             }
         }
         false
@@ -257,6 +296,17 @@ impl App {
 
         terminal
             .draw(|c| {
+                let w = c.width();
+                // Draw error bar
+                if self.dirty {
+                    let msg = "File content have changed, press 'r' to refresh";
+                    c.top()
+                        .draw(format_args!("{msg:^0$}", w), none().fg(Color::Red));
+                } else if !self.err.is_empty() {
+                    c.top()
+                        .draw(format_args!("{:^1$}", self.err, w), none().fg(Color::Red));
+                }
+
                 // Sync state with indexer
                 let nb_row = index.nb_row();
                 let is_loading = index.is_loading();
@@ -291,7 +341,7 @@ impl App {
                                 },
                             );
                         if let Some(headers) = &index.headers {
-                            stat.header_name(headers.get(offset).unwrap_or_else(|| "?"));
+                            stat.header_name(headers.get(offset).unwrap_or_else(|| BStr::new("?")));
                         } else {
                             stat.header_idx(offset + 1);
                         }
@@ -305,31 +355,46 @@ impl App {
                 cols.sort_unstable_by_key(|(i, _, _, _)| *i); // Find a way to store col in order
                 drop(col_offset_iter);
 
-                // Draw error bar
-                if self.dirty {
-                    let w = c.width();
-                    let msg = "File content have changed, press 'r' to refresh";
-                    c.top()
-                        .draw(format_args!("{msg:^0$}", w), none().bg(Color::Red));
-                }
-
                 // Draw status bar
                 let mut l = c.btm();
-                if let Some(char) = spinner.state(is_loading) {
-                    l.rdraw(char, none().fg(Color::Green));
+                if let Some(filter) = &self.filter {
+                    l.draw("filter: ", none());
+                    for win in Highlighter::new(filter).styles.windows(2) {
+                        match win {
+                            [(start, _), (end, style)] => {
+                                l.draw(
+                                    &filter[*start..*end],
+                                    match style {
+                                        Style::None => none(),
+                                        Style::Id => none().fg(Color::Blue),
+                                        Style::Nb => none().fg(Color::Yellow),
+                                        Style::Str => none().fg(Color::Green),
+                                        Style::Regex => none().fg(Color::Magenta),
+                                        Style::Action => none().fg(Color::Red),
+                                        Style::Logi => none().fg(Color::Cyan),
+                                    },
+                                );
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    l.cursor();
+                } else {
+                    if let Some(char) = spinner.state(is_loading) {
+                        l.rdraw(char, none().fg(Color::Green));
+                    }
+                    l.rdraw(fmt::quantity(fmt_buff, nb_row), none());
+                    l.rdraw(':', grey());
+                    l.rdraw(fmt::quantity(fmt_buff, nb_col), none());
+                    l.rdraw('|', grey());
+                    l.rdraw(fmt::quantity(fmt_buff, nav.cursor_row() + 1), none());
+                    l.rdraw(':', grey());
+                    l.rdraw(fmt::quantity(fmt_buff, nav.cursor_col() + 1), none());
+                    l.rdraw(' ', none());
+                    l.draw(&config.path, none().fg(Color::Green));
                 }
-                l.rdraw(fmt::quantity(fmt_buff, nb_row), none());
-                l.rdraw(':', grey());
-                l.rdraw(fmt::quantity(fmt_buff, nb_col), none());
-                l.rdraw('|', grey());
-                l.rdraw(fmt::quantity(fmt_buff, nav.cursor_row() + 1), none());
-                l.rdraw(':', grey());
-                l.rdraw(fmt::quantity(fmt_buff, nav.cursor_col() + 1), none());
-                l.rdraw(' ', none());
-                l.draw(&config.path, none().fg(Color::Green));
 
                 // Draw headers
-
                 let line = &mut c.top();
                 for (i, _, _, budget) in &cols {
                     let style = if *i == nav.cursor_col() {
@@ -338,7 +403,7 @@ impl App {
                         none().fg(Color::Blue).bold()
                     };
                     let header = if let Some(header) = &index.headers {
-                        let name = header.get(*i).unwrap_or_else(|| "?");
+                        let name = header.get(*i).unwrap_or_else(|| BStr::new("?"));
                         rtrim(name, fmt_buff, *budget)
                     } else {
                         rtrim(*i + 1, fmt_buff, *budget)
@@ -369,7 +434,7 @@ impl App {
 
 struct Grid {
     /// Rows metadata
-    rows: Vec<(usize, StringRecord)>,
+    rows: Vec<(usize, NestedString)>,
     /// Number of fresh rows
     len: usize,
 }
@@ -392,7 +457,7 @@ impl Grid {
 
     fn read_row(&mut self, line: usize, offset: u64, rdr: &mut CsvReader) -> io::Result<()> {
         if self.len == self.rows.len() {
-            let mut nested = StringRecord::new();
+            let mut nested = NestedString::new();
             rdr.record_at(&mut nested, offset)?;
             self.rows.push((line, nested));
         } else if let Some(pos) = self.rows.iter().position(|(l, _)| *l == line) {
@@ -406,7 +471,7 @@ impl Grid {
         Ok(())
     }
 
-    pub fn rows(&self) -> &[(usize, StringRecord)] {
+    pub fn rows(&self) -> &[(usize, NestedString)] {
         &self.rows[..self.len]
     }
 }
@@ -416,16 +481,16 @@ struct IndexerState {
 }
 
 pub struct Indexer {
-    pub headers: Option<StringRecord>,
+    pub headers: Option<NestedString>,
     task: Arc<Mutex<IndexerState>>,
-    // TODO show error
+    filter: Arc<Filter>, // TODO show error
 }
 
 impl Indexer {
-    pub fn index(config: &Config) -> io::Result<Self> {
+    pub fn index(config: &Config, filter: Arc<Filter>) -> io::Result<Self> {
         let mut rdr = config.reader()?;
         let headers = if config.has_header {
-            let mut nested = StringRecord::new();
+            let mut nested = NestedString::new();
             rdr.record(&mut nested)?;
             Some(nested)
         } else {
@@ -434,50 +499,80 @@ impl Indexer {
         let task = Arc::new(Mutex::new(IndexerState { index: vec![] }));
         {
             let task = task.clone();
-            thread::spawn(|| Self::bg_index(rdr, task));
+            let filter = filter.clone();
+            thread::spawn(|| Self::bg_index(rdr, filter, task));
         }
 
-        Ok(Self { headers, task })
+        Ok(Self {
+            headers,
+            task,
+            filter,
+        })
     }
 
-    fn bg_index(mut rdr: CsvReader, task: Arc<Mutex<IndexerState>>) -> io::Result<()> {
-        let (file, rdr) = rdr.inner_mut();
+    fn bg_index(
+        mut rdr: CsvReader,
+        filter: Arc<Filter>,
+        task: Arc<Mutex<IndexerState>>,
+    ) -> io::Result<()> {
+        if !filter.source.is_empty() {
+            // Slower filtering indexer
+            let engine = Engine::new(&filter);
+            let mut record = NestedString::new();
+            let mut pos = rdr.file.stream_position()?;
 
-        // Dummy ignored buffer
-        let mut out = [0; BUF_LEN];
-        let mut bounds = [0; 100];
-
-        let mut pos = file.stream_position()?;
-        let mut buff_pos = vec![pos];
-
-        loop {
-            let buff = file.fill_buf()?;
-            let (result, amount, _, _) = rdr.read_record(buff, &mut out, &mut bounds);
-            pos += amount as u64;
-            file.consume(amount);
-            match result {
-                ReadRecordResult::InputEmpty
-                | ReadRecordResult::OutputFull
-                | ReadRecordResult::OutputEndsFull => continue, // We ignore outputs
-                ReadRecordResult::Record => {
-                    // Throttle locking
-                    if buff_pos.len() == 100 {
-                        // If arc is unique this task is canceled
-                        if Arc::strong_count(&task) == 1 {
-                            return Ok(());
-                        }
-                        task.lock().index.append(&mut buff_pos)
+            loop {
+                let amount = rdr.record(&mut record)?;
+                pos += amount as u64;
+                if engine.check(&record) {
+                    // If arc is unique this task is canceled
+                    if Arc::strong_count(&task) == 1 {
+                        return Ok(());
                     }
-                    buff_pos.push(pos);
+                    task.lock().index.push(pos);
                 }
-                ReadRecordResult::End => break,
+            }
+        } else {
+            // Very fast line indexer with minimal allocation
+            let (file, rdr) = rdr.inner_mut();
+
+            let mut pos = file.stream_position()?;
+            let mut buff_pos = vec![pos];
+
+            // Dummy ignored buffer
+            let mut out = [0; BUF_LEN];
+            let mut bounds = [0; 100];
+
+            loop {
+                let buff = file.fill_buf()?;
+                let (result, amount, _, _) = rdr.read_record(buff, &mut out, &mut bounds);
+                pos += amount as u64;
+                file.consume(amount);
+                match result {
+                    ReadRecordResult::InputEmpty
+                    | ReadRecordResult::OutputFull
+                    | ReadRecordResult::OutputEndsFull => continue, // We ignore outputs
+                    ReadRecordResult::Record => {
+                        // Throttle locking
+                        if buff_pos.len() == 100 {
+                            // If arc is unique this task is canceled
+                            if Arc::strong_count(&task) == 1 {
+                                return Ok(());
+                            }
+                            task.lock().index.append(&mut buff_pos)
+                        }
+                        buff_pos.push(pos);
+                    }
+                    ReadRecordResult::End => break,
+                }
+            }
+            buff_pos.pop();
+            {
+                // Finalize state
+                task.lock().index.append(&mut buff_pos);
             }
         }
-        buff_pos.pop();
-        {
-            // Finalize state
-            task.lock().index.append(&mut buff_pos);
-        }
+
         Ok(())
     }
 
@@ -496,5 +591,17 @@ impl Indexer {
         let lock = self.task.lock();
         rows.map_while(|i| lock.index.get(i).map(|p| (i, *p)))
             .collect()
+    }
+}
+
+trait BStrWidth {
+    fn width(&self) -> usize;
+}
+
+impl BStrWidth for BStr {
+    fn width(&self) -> usize {
+        self.chars()
+            .map(|c| c.width().unwrap_or(0))
+            .fold(0, Add::add)
     }
 }

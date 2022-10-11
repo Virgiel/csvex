@@ -30,12 +30,12 @@ impl CsvReader {
     }
 
     /// Read a record into a nested string
-    pub fn record(&mut self, nested: &mut impl Record) -> io::Result<usize> {
+    pub fn record(&mut self, nested: &mut NestedString) -> io::Result<usize> {
         nested.read_record(&mut self.file, &mut self.rdr)
     }
 
     /// Read a record into a nested string from a random place in CSV file
-    pub fn record_at(&mut self, nested: &mut impl Record, offset: u64) -> io::Result<usize> {
+    pub fn record_at(&mut self, nested: &mut NestedString, offset: u64) -> io::Result<usize> {
         self.seek(offset)?;
         self.record(nested)
     }
@@ -108,60 +108,23 @@ impl<T: Default + Copy, const N: usize> DerefMut for InitVec<T, N> {
     }
 }
 
-pub trait Record {
-    fn read_record(
-        &mut self,
-        file: &mut BufReader<File>,
-        rdr: &mut csv_core::Reader,
-    ) -> io::Result<usize>;
-}
-
-pub struct StringRecord(BytesRecord);
-
-impl Record for StringRecord {
-    fn read_record(
-        &mut self,
-        file: &mut BufReader<File>,
-        rdr: &mut csv_core::Reader,
-    ) -> io::Result<usize> {
-        let amount = self.0.read_record(file, rdr)?;
-        self.0.in_place_str_lossy();
-        Ok(amount)
-    }
-}
-
-impl StringRecord {
-    pub fn new() -> Self {
-        Self(BytesRecord::new())
-    }
-
-    pub fn get(&self, idx: usize) -> Option<&str> {
-        self.0.get(idx).map(|it| {
-            debug_assert!(std::str::from_utf8(it).is_ok());
-            unsafe { std::str::from_utf8_unchecked(it) }
-        })
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &str> {
-        self.0.iter().map(|it| {
-            debug_assert!(std::str::from_utf8(it).is_ok());
-            unsafe { std::str::from_utf8_unchecked(it) }
-        })
-    }
-}
-
-pub struct BytesRecord {
+pub struct NestedString {
     /// Common allocation for all strings
     buff: InitVec<u8, BUF_LEN>,
     /// End of each string in buf
     bounds: InitVec<usize, 50>,
 }
 
-impl Record for BytesRecord {
+impl NestedString {
+    pub fn new() -> Self {
+        let mut bounds = InitVec::new();
+        bounds.set_len(0);
+        Self {
+            buff: InitVec::new(),
+            bounds,
+        }
+    }
+
     fn read_record(
         &mut self,
         file: &mut BufReader<File>,
@@ -192,67 +155,9 @@ impl Record for BytesRecord {
         }
         Ok(nb_read)
     }
-}
-
-impl BytesRecord {
-    pub fn new() -> Self {
-        let mut bounds = InitVec::new();
-        bounds.set_len(0);
-        Self {
-            buff: InitVec::new(),
-            bounds,
-        }
-    }
-
-    /// Clean fields, turn into trimmed valid UTF-8 fields in place
-    ///
-    /// It's very expensive, you don't want to not run it if you don't need a valid utf8,
-    /// but if you do need it, you want it to be cached and allocation free
-    fn in_place_str_lossy(&mut self) {
-        let mut write_pos = 0;
-        let mut prev = 0;
-        let mut read_offset = 0;
-        for i in 0..self.bounds.len() - 1 {
-            let (mut start, mut end) = (prev + read_offset, self.bounds[i + 1] + read_offset);
-            // Trim
-            start = end - BStr::new(&self.buff[start..end]).trim_start().len();
-            end = start + BStr::new(&self.buff[start..end]).trim_end().len();
-
-            // In place to_str
-            while start != end {
-                let (valid_up_to, error_len) = match BStr::new(&self.buff[start..end]).to_str() {
-                    Ok(str) => (str.len(), 0),
-                    Err(err) => (err.valid_up_to(), err.error_len().unwrap_or(0)),
-                };
-                // Move valid part
-                if start != write_pos {
-                    self.buff.copy_within(start..start + valid_up_to, write_pos)
-                }
-                write_pos += valid_up_to;
-                start += valid_up_to;
-                // Replace error part
-                if error_len != 0 {
-                    if start - write_pos < 3 {
-                        let from = start + error_len;
-                        let amount = self.buff.len() - from;
-                        self.buff.advance(3);
-                        self.buff.copy_within(from..from + amount, from + 3);
-                        read_offset += 3;
-                        start += 3;
-                        end += 3;
-                    }
-                    self.buff[write_pos..][..3].copy_from_slice(&[239, 191, 189]);
-                    write_pos += 3;
-                    start += error_len;
-                }
-            }
-            prev = self.bounds[i + 1];
-            self.bounds[i + 1] = write_pos;
-        }
-    }
 
     fn get_range(&self, range: Range<usize>) -> &BStr {
-        BStr::new(&self.buff[range])
+        BStr::new(BStr::new(&self.buff[range]).trim())
     }
 
     pub fn get(&self, idx: usize) -> Option<&BStr> {

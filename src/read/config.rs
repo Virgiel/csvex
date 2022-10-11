@@ -5,7 +5,7 @@ use std::{
 
 use crate::fmt::Ty;
 
-use super::{CsvReader, StringRecord};
+use super::{CsvReader, NestedString};
 
 #[derive(Clone)]
 pub struct Config {
@@ -69,7 +69,7 @@ fn sniff_delimiter(file: &mut BufReader<File>) -> io::Result<u8> {
 
 /// Guess the csv delimiter from the first line
 fn sniff_has_header(rdr: &mut CsvReader) -> io::Result<bool> {
-    let mut record = StringRecord::new();
+    let mut record = NestedString::new();
     rdr.record(&mut record)?; // Read headers
     let mut tys = Vec::with_capacity(record.len());
     let mut found_empty = false;
