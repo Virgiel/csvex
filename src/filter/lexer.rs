@@ -23,7 +23,6 @@ pub enum TokenKind {
     Nb,         // Decimal Number
     Str,        // surrounded by "
     Id,         // surrounded by whitespace
-    Err,
     Eof,
 }
 
@@ -97,7 +96,7 @@ impl<'a> Lexer<'a> {
     }
 
     pub fn peek(&mut self) -> &Token<'a> {
-        if let None = self.peeked {
+        if self.peeked.is_none() {
             self.peeked = Some(self.lex_next());
         }
         self.peeked.as_ref().unwrap()
@@ -113,7 +112,7 @@ impl<'a> Lexer<'a> {
         let remaining = &self.source[self.offset..];
         let bytes = remaining.as_bytes();
 
-        if let Some(first) = bytes.get(0) {
+        if let Some(first) = bytes.first() {
             // Two char keyword
             if let Some(second) = bytes.get(1) {
                 let kind = match [*first, *second] {
@@ -158,20 +157,20 @@ impl<'a> Lexer<'a> {
                 '"' => {
                     // Search next "
                     let len = chars
-                        .find_map(|(i, c)| (c == '"').then(|| i + 1))
+                        .find_map(|(i, c)| (c == '"').then_some(i + 1))
                         .unwrap_or(remaining.len());
                     self.token(TokenKind::Str, len)
                 }
                 c if c.is_ascii_digit() => {
                     let len = chars
-                        .find_map(|(i, c)| (!c.is_ascii_digit()).then(|| i))
+                        .find_map(|(i, c)| (!c.is_ascii_digit()).then_some(i))
                         .unwrap_or(remaining.len());
                     self.token(TokenKind::Nb, len)
                 }
                 _ => {
                     // Search end of possible slice
                     let len = chars
-                        .find_map(|(i, c)| (!c.is_alphanumeric()).then(|| i))
+                        .find_map(|(i, c)| (!c.is_alphanumeric()).then_some(i))
                         .unwrap_or(remaining.len());
                     let kind = match &remaining[..len] {
                         "eq" => TokenKind::Cmp(CmpOp::Eq),

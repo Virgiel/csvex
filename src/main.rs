@@ -1,15 +1,13 @@
 use std::{
-    io::{self, Seek},
+    io::{self},
     ops::{Add, Range},
-    sync::Arc,
-    thread,
     time::{Duration, Instant, SystemTime},
 };
 
 use bstr::{BStr, ByteSlice};
-use filter::{Engine, Filter, Highlighter, Style};
+use filter::{Filter, Highlighter, Style};
 use fmt::{fmt_field, rtrim, ColStat, FmtBuffer, Ty};
-use parking_lot::Mutex;
+use index::Indexer;
 use prompt::{Prompt, PromptCmd};
 use read::{Config, CsvReader, NestedString};
 use spinner::Spinner;
@@ -22,131 +20,11 @@ use tui::{
 
 mod filter;
 mod fmt;
+mod index;
+mod prompt;
 mod read;
 mod spinner;
 mod style;
-mod prompt {
-    use reedline::LineBuffer;
-
-    struct HistoryBuffer<T, const N: usize> {
-        ring: [T; N],
-        head: usize,
-        filled: bool,
-    }
-
-    impl<T: Default, const N: usize> HistoryBuffer<T, N> {
-        pub fn new() -> Self {
-            Self {
-                ring: std::array::from_fn(|_| T::default()),
-                head: 0,
-                filled: false,
-            }
-        }
-
-        pub fn push(&mut self, item: T) {
-            self.ring[self.head] = item;
-            if self.head + 1 == self.ring.len() {
-                self.filled = true;
-            }
-            self.head = (self.head + 1) % self.ring.len();
-        }
-
-        pub fn get(&self, idx: usize) -> &T {
-            assert!(idx <= self.ring.len() && self.len() > 0);
-            let pos = (self.ring.len() + self.head - idx - 1) % self.ring.len();
-            &self.ring[pos]
-        }
-
-        pub fn len(&self) -> usize {
-            if self.filled {
-                self.ring.len()
-            } else {
-                self.head
-            }
-        }
-    }
-
-    pub struct Prompt {
-        history: HistoryBuffer<String, 5>,
-        pos: Option<usize>,
-        buffer: LineBuffer,
-    }
-
-    impl Prompt {
-        pub fn new() -> Self {
-            Self {
-                history: HistoryBuffer::new(),
-                pos: None,
-                buffer: LineBuffer::new(),
-            }
-        }
-
-        /// Ensure buffer contains the right data
-        fn solidify(&mut self) {
-            if let Some(pos) = self.pos.take() {
-                self.buffer.clear();
-                self.buffer.insert_str(self.history.get(pos));
-            }
-        }
-
-        pub fn exec(&mut self, cmd: PromptCmd) {
-            match cmd {
-                PromptCmd::Write(c) => {
-                    self.solidify();
-                    self.buffer.insert_char(c);
-                }
-                PromptCmd::Left => {
-                    self.solidify();
-                    self.buffer.move_left();
-                }
-                PromptCmd::Right => {
-                    self.solidify();
-                    self.buffer.move_right()
-                }
-                PromptCmd::Delete => {
-                    self.solidify();
-                    self.buffer.delete_left_grapheme();
-                }
-                PromptCmd::Prev => match &mut self.pos {
-                    Some(pos) if *pos + 1 < self.history.len() => *pos += 1,
-                    None if self.history.len() > 0 => self.pos = Some(0),
-                    _ => {}
-                },
-                PromptCmd::Next => match &mut self.pos {
-                    Some(0) => self.pos = None,
-                    Some(pos) => *pos = pos.saturating_sub(1),
-                    None => {}
-                },
-                PromptCmd::New => {
-                    let (str, _) = self.state();
-                    self.history.push(str.into());
-                    self.pos = None;
-                    self.buffer.clear();
-                }
-            }
-        }
-
-        pub fn state(&self) -> (&str, usize) {
-            match self.pos {
-                Some(pos) => {
-                    let str = self.history.get(pos);
-                    (str, str.len())
-                }
-                None => (self.buffer.get_buffer(), self.buffer.insertion_point()),
-            }
-        }
-    }
-
-    pub enum PromptCmd {
-        Write(char),
-        Left,
-        Right,
-        Prev,
-        Next,
-        New,
-        Delete,
-    }
-}
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -200,7 +78,7 @@ impl FilterPrompt {
         }
     }
 
-    pub fn on_key(&mut self, code: KeyCode) -> Option<Arc<Filter>> {
+    pub fn on_key(&mut self, code: KeyCode) -> Option<Filter> {
         self.err = None;
         match code {
             KeyCode::Char(c) => self.prompt.exec(PromptCmd::Write(c)),
@@ -211,7 +89,7 @@ impl FilterPrompt {
             KeyCode::Backspace => self.prompt.exec(PromptCmd::Delete),
             KeyCode::Enter => {
                 let (str, _) = self.prompt.state();
-                match Filter::compile(str.into()) {
+                match Filter::compile(str) {
                     Ok(filter) => {
                         self.prompt.exec(PromptCmd::New);
                         return Some(filter);
@@ -287,7 +165,7 @@ impl FilterPrompt {
 fn main() {
     let path = std::env::args()
         .nth(1)
-        .unwrap_or("../../Downloads/adresses-france.csv".to_string());
+        .unwrap_or_else(|| "../../Downloads/adresses-france.csv".to_string());
     let mut app = App::open(path.clone()).unwrap();
     let mut watcher = FileWatcher::new(path).unwrap();
     let mut redraw = true;
@@ -461,7 +339,11 @@ impl App {
 
     pub fn refresh(&mut self) {
         let (config, rdr) = Config::sniff(self.config.path.clone()).unwrap();
-        let index = Indexer::index(&config, self.indexer.filter.clone()).unwrap();
+        let index = Indexer::index(
+            &config,
+            Filter::compile(self.indexer.filter().unwrap_or("")).unwrap(),
+        )
+        .unwrap();
         self.config = config;
         self.rdr = rdr;
         self.indexer = index;
@@ -479,10 +361,8 @@ impl App {
             if self.focus_filter_prompt {
                 if let KeyCode::Esc = event.code {
                     self.focus_filter_prompt = false;
-                } else {
-                    if let Some(filter) = self.filter_prompt.on_key(event.code) {
-                        self.indexer = Indexer::index(&self.config, filter).unwrap();
-                    }
+                } else if let Some(filter) = self.filter_prompt.on_key(event.code) {
+                    self.indexer = Indexer::index(&self.config, filter).unwrap();
                 }
             } else {
                 match event.code {
@@ -524,7 +404,7 @@ impl App {
         let nb_col = rows
             .iter()
             .map(|(_, n)| n.len())
-            .chain([self.indexer.headers.len()])
+            .chain([self.indexer.headers().len()])
             .max()
             .unwrap_or(0);
         let id_len = rows
@@ -548,7 +428,7 @@ impl App {
                             (vec, stat)
                         },
                     );
-                if let Some(name) = self.indexer.headers.get(offset) {
+                if let Some(name) = self.indexer.headers().get(offset) {
                     stat.header_name(name);
                 } else {
                     stat.header_idx(offset + 1);
@@ -565,7 +445,7 @@ impl App {
 
         // Draw status bar
         let mut l = c.btm();
-        if self.focus_filter_prompt || !self.indexer.filter.source.is_empty() {
+        if self.focus_filter_prompt || self.indexer.filter().is_some() {
             l.draw(" FILTER ", none().bg(Color::Magenta).bold());
         } else {
             l.draw(" NORMAL ", none().bg(Color::DarkGrey).bold());
@@ -588,8 +468,8 @@ impl App {
             none(),
         );
         l.draw(" ", none());
-        if !self.indexer.filter.source.is_empty() {
-            FilterPrompt::draw_filter(&mut l, &self.indexer.filter.source);
+        if let Some(filter) = self.indexer.filter() {
+            FilterPrompt::draw_filter(&mut l, filter);
         } else {
             l.draw(&self.config.path, none().fg(Color::Green));
         }
@@ -607,7 +487,7 @@ impl App {
             );
 
             for (i, _, _, budget) in &cols {
-                let header = if let Some(name) = self.indexer.headers.get(*i) {
+                let header = if let Some(name) = self.indexer.headers().get(*i) {
                     rtrim(name, &mut self.fmt_buff, *budget)
                 } else {
                     rtrim(*i + 1, &mut self.fmt_buff, *budget)
@@ -688,96 +568,6 @@ impl Grid {
 
     pub fn rows(&self) -> &[(u32, NestedString)] {
         &self.rows[..self.len]
-    }
-}
-
-struct IndexerState {
-    index: Vec<(u32, u64)>,
-}
-
-pub struct Indexer {
-    pub headers: Arc<NestedString>,
-    task: Arc<Mutex<IndexerState>>,
-    filter: Arc<Filter>, // TODO show error
-}
-
-impl Indexer {
-    pub fn index(config: &Config, filter: Arc<Filter>) -> io::Result<Self> {
-        let mut rdr = config.reader()?;
-        let mut headers = NestedString::new();
-        if config.has_header {
-            rdr.record(&mut headers)?;
-        }
-        let headers = Arc::new(headers);
-
-        let task = Arc::new(Mutex::new(IndexerState { index: vec![] }));
-        {
-            let task = task.clone();
-            let filter = filter.clone();
-            let headers = headers.clone();
-            thread::spawn(|| Self::bg_index(rdr, filter, headers, task));
-        }
-
-        Ok(Self {
-            headers,
-            task,
-            filter,
-        })
-    }
-
-    fn bg_index(
-        mut rdr: CsvReader,
-        filter: Arc<Filter>,
-        headers: Arc<NestedString>,
-        task: Arc<Mutex<IndexerState>>,
-    ) -> io::Result<()> {
-        // Slower filtering indexer
-        let engine = Engine::new(&filter, &headers);
-        let mut record = NestedString::new();
-        let mut pos = rdr.file.stream_position()?;
-        let mut buff_pos = Vec::with_capacity(100);
-
-        let mut count = 0;
-        loop {
-            let amount = rdr.record(&mut record)?;
-            if amount == 0 {
-                break;
-            } else if engine.check(&record) {
-                task.lock().index.push((count, pos));
-            }
-
-            pos += amount as u64;
-            count += 1;
-
-            // Throttle locking
-            if count % 100 == 0 {
-                // If arc is unique this task is canceled
-                if Arc::strong_count(&task) == 1 {
-                    return Ok(());
-                }
-                if !buff_pos.is_empty() {
-                    task.lock().index.append(&mut buff_pos);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    // Check if the indexer is working in the background
-    pub fn is_loading(&self) -> bool {
-        Arc::strong_count(&self.task) == 2
-    }
-
-    /// Get number of indexed rows
-    pub fn nb_row(&self) -> usize {
-        self.task.lock().index.len()
-    }
-
-    /// Get offsets of given rows
-    pub fn get_offsets(&self, rows: impl Iterator<Item = usize>) -> Vec<(u32, u64)> {
-        let locked = self.task.lock();
-        rows.map_while(|i| locked.index.get(i).copied()).collect()
     }
 }
 

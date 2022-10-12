@@ -1,4 +1,4 @@
-use std::{ops::Range, sync::Arc};
+use std::ops::Range;
 
 use regex::bytes::Regex;
 use rust_decimal::Decimal;
@@ -183,7 +183,7 @@ impl Highlighter {
             self.parse_action(lexer);
             let token = lexer.next();
             if let TokenKind::Logi(_) = token.kind {
-                self.add(token.span.clone(), Style::Logi);
+                self.add(token.span, Style::Logi);
             } else if token.kind == TokenKind::Eof {
                 self.add(token.span, Style::None);
                 return;
@@ -203,18 +203,12 @@ pub struct Filter {
 }
 
 impl Filter {
-    pub fn empty() -> Arc<Self> {
-        Arc::new(Self {
-            values: vec![],
-            regex: vec![],
-            idx: vec![],
-            nodes: vec![],
-            source: String::new(),
-            start: 0,
-        })
+    pub fn empty() -> Self {
+        Self::compile("").unwrap()
     }
 
-    pub fn compile(source: String) -> Result<Arc<Self>> {
+    pub fn compile(source: &str) -> Result<Self> {
+        let source = source.trim();
         let mut tmp = Self {
             values: vec![],
             regex: vec![],
@@ -223,12 +217,14 @@ impl Filter {
             source: String::new(),
             start: 0,
         };
-        let mut lexer = Lexer::load(&source);
+        let mut lexer = Lexer::load(source);
+        if lexer.peek().kind != TokenKind::Eof {
+            let start = tmp.parse_expr(&mut lexer)?;
+            tmp.start = start;
+        }
 
-        let start = tmp.parse_expr(&mut lexer)?;
-        tmp.start = start;
-        tmp.source = source;
-        Ok(Arc::new(tmp))
+        tmp.source = source.to_string();
+        Ok(tmp)
     }
 
     fn add<T>(vec: &mut Vec<T>, value: T) -> u32 {
@@ -312,7 +308,7 @@ impl Filter {
         Self::list(lexer, &mut self.regex, |lexer| {
             let token = lexer.next();
             if token.kind == TokenKind::Str || token.kind == TokenKind::Id {
-                Regex::new(&token.str.trim_matches('"')).map_err(|_| (token.span, "Invalid regex"))
+                Regex::new(token.str.trim_matches('"')).map_err(|_| (token.span, "Invalid regex"))
             } else {
                 Err((token.span, "Expected regex"))
             }

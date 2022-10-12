@@ -1,8 +1,4 @@
-use tui::{none, Color, Style};
-
-pub fn grey() -> Style {
-    none().fg(Color::DarkGrey)
-}
+use tui::{Color, Style};
 
 pub fn reverse(style: Style) -> Style {
     style

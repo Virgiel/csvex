@@ -46,10 +46,6 @@ impl CsvReader {
         self.rdr.reset();
         Ok(())
     }
-
-    pub fn inner_mut(&mut self) -> (&mut BufReader<File>, &mut csv_core::Reader) {
-        (&mut self.file, &mut self.rdr)
-    }
 }
 
 /// Byte vector that is backed by an always initialize slice so we can write in the currently

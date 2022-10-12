@@ -28,23 +28,19 @@ pub enum Ty {
 
 impl Ty {
     pub fn guess(s: &BStr) -> Ty {
-        if s.is_empty() {
-            Ty::Str
-        } else {
-            if let Ok(s) = s.to_str() {
-                if s.parse::<Decimal>().is_ok() {
-                    let lhs = s.find('.').unwrap_or(s.len()); // Everything before .
-                    let rhs = s.len() - lhs;
-                    Ty::Nb { rhs, lhs }
-                } else {
-                    match s {
-                        "true" | "True" | "TRUE" | "false" | "False" | "FALSE" => Ty::Bool,
-                        _ => Ty::Str,
-                    }
-                }
+        if let Ok(s) = s.to_str() {
+            if s.parse::<Decimal>().is_ok() {
+                let lhs = s.find('.').unwrap_or(s.len()); // Everything before .
+                let rhs = s.len() - lhs;
+                Ty::Nb { rhs, lhs }
             } else {
-                Ty::Str
+                match s {
+                    "true" | "True" | "TRUE" | "false" | "False" | "FALSE" => Ty::Bool,
+                    _ => Ty::Str,
+                }
             }
+        } else {
+            Ty::Str
         }
     }
 

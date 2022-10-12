@@ -85,7 +85,7 @@ impl<'r> Engine<'r> {
         range: Range<u32>,
     ) -> bool {
         let str = self.by_id(record, id_i);
-        let mut values = self.filter.values[range.start as usize..range.end as usize].into_iter();
+        let mut values = self.filter.values[range.start as usize..range.end as usize].iter();
         match m {
             MatchOp::All => values.all(|value| Self::check_action(self, str, op, value)),
             MatchOp::Any => values.any(|value| Self::check_action(self, str, op, value)),
@@ -94,7 +94,7 @@ impl<'r> Engine<'r> {
 
     fn per_match(&self, record: &NestedString, id_i: u32, m: MatchOp, range: Range<u32>) -> bool {
         let str = self.by_id(record, id_i);
-        let mut regs = self.filter.regex[range.start as usize..range.end as usize].into_iter();
+        let mut regs = self.filter.regex[range.start as usize..range.end as usize].iter();
         match m {
             MatchOp::All => regs.all(|value| value.is_match(str)),
             MatchOp::Any => regs.any(|value| value.is_match(str)),
@@ -125,7 +125,7 @@ impl<'r> Engine<'r> {
     }
 
     pub fn check(&self, record: &NestedString) -> bool {
-        if self.filter.source.is_empty() {
+        if self.filter.nodes.is_empty() {
             true
         } else {
             self.run_node(record, self.filter.start)
