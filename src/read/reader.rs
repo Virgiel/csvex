@@ -118,7 +118,7 @@ pub struct NestedString {
 impl NestedString {
     pub fn new() -> Self {
         let mut bounds = InitVec::new();
-        bounds.set_len(0);
+        bounds.set_len(1);
         Self {
             buff: InitVec::new(),
             bounds,

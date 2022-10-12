@@ -3,7 +3,7 @@ use std::{ops::Range, sync::Arc};
 use regex::bytes::Regex;
 use rust_decimal::Decimal;
 
-use super::lexer::{CmpOp, Lexer, LogiOp, MatchOp, TokenKind, ValueKind};
+use super::lexer::{CmpOp, Lexer, LogiOp, MatchOp, TokenKind};
 
 type Result<T> = std::result::Result<T, (Range<usize>, &'static str)>;
 
@@ -35,6 +35,12 @@ pub enum Value {
     Str(Range<usize>),
 }
 
+pub enum Id {
+    Idx(u32),
+    Name(Range<usize>),
+}
+
+#[derive(Debug, Clone, Copy)]
 pub enum Style {
     None,
     Id,
@@ -46,36 +52,54 @@ pub enum Style {
 }
 
 pub struct Highlighter {
-    pub styles: Vec<(usize, Style)>,
+    styles: Vec<(usize, Style)>,
+    idx: usize,
 }
 
 impl Highlighter {
     pub fn new(source: &str) -> Self {
         let mut tmp = Self {
             styles: vec![(0, Style::None)],
+            idx: 0,
         };
         tmp.parse_expr(&mut Lexer::load(source));
         tmp
     }
 
-    fn add(&mut self, range: Range<usize>, style: Style) {
-        let last = self.styles.last().unwrap();
-        if last.0 != range.start {
-            self.styles.push((range.start, Style::None))
+    pub fn style(&mut self, pos: usize) -> Style {
+        // Move left
+        while pos < self.styles[self.idx].0 {
+            self.idx -= 1;
         }
-        self.styles.push((range.end, style))
+
+        // Move right
+        while self.idx < self.styles.len() && pos >= self.styles[self.idx + 1].0 {
+            self.idx += 1;
+        }
+
+        self.styles[self.idx].1
+    }
+
+    fn add(&mut self, range: Range<usize>, style: Style) {
+        let last = self.styles.last_mut().unwrap();
+        if last.0 == range.start {
+            last.1 = style;
+        } else {
+            self.styles.push((range.start, style));
+        }
+        self.styles.push((range.end, Style::None));
     }
 
     fn parse_range(&mut self, lexer: &mut Lexer) {
         if let Some(token) = lexer.take_kind(TokenKind::OpenRange) {
             self.add(token.span, Style::Id);
-            if let Some(token) = lexer.take_kind(TokenKind::Value(ValueKind::Nb)) {
+            if let Some(token) = lexer.take_kind(TokenKind::Nb) {
                 self.add(token.span, Style::Id);
             }
             if let Some(token) = lexer.take_kind(TokenKind::SepRange) {
                 self.add(token.span, Style::Id);
             }
-            if let Some(token) = lexer.take_kind(TokenKind::Value(ValueKind::Nb)) {
+            if let Some(token) = lexer.take_kind(TokenKind::Nb) {
                 self.add(token.span, Style::Id);
             }
             if let Some(token) = lexer.take_kind(TokenKind::CloseRange) {
@@ -106,7 +130,7 @@ impl Highlighter {
 
     fn parse_regex(&mut self, lexer: &mut Lexer) {
         self.list(lexer, |this, lexer| {
-            if let Some(t) = lexer.take_kind(TokenKind::Value(ValueKind::Str)) {
+            if let Some(t) = lexer.take_kind(TokenKind::Str) {
                 this.add(t.span, Style::Regex)
             }
         });
@@ -116,16 +140,17 @@ impl Highlighter {
         self.list(lexer, |this, lexer| {
             let t = lexer.next();
             match t.kind {
-                TokenKind::Value(ValueKind::Nb) => this.add(t.span, Style::Nb),
-                TokenKind::Value(ValueKind::Str) => this.add(t.span, Style::Str),
+                TokenKind::Nb => this.add(t.span, Style::Nb),
+                TokenKind::Str | TokenKind::Id => this.add(t.span, Style::Str),
                 _ => {}
             }
         })
     }
 
     fn parse_action(&mut self, lexer: &mut Lexer) {
-        if let Some(t) = lexer.take_kind(TokenKind::Value(ValueKind::Nb)) {
-            self.add(t.span, Style::Id)
+        let token = lexer.next();
+        if [TokenKind::Nb, TokenKind::Str, TokenKind::Id].contains(&token.kind) {
+            self.add(token.span, Style::Id)
         }
         self.parse_range(lexer);
 
@@ -171,7 +196,7 @@ impl Highlighter {
 pub struct Filter {
     pub(crate) values: Vec<Value>,
     pub(crate) regex: Vec<Regex>,
-    pub(crate) idx: Vec<(u32, (u32, u32))>,
+    pub(crate) idx: Vec<(Id, (u32, u32))>,
     pub(crate) nodes: Vec<Node>,
     pub(crate) source: String,
     pub(crate) start: u32,
@@ -189,7 +214,7 @@ impl Filter {
         })
     }
 
-    pub fn new(source: String) -> Result<Arc<Self>> {
+    pub fn compile(source: String) -> Result<Arc<Self>> {
         let mut tmp = Self {
             values: vec![],
             regex: vec![],
@@ -214,11 +239,11 @@ impl Filter {
     fn parse_range(&mut self, lexer: &mut Lexer) -> Result<(u32, u32)> {
         if lexer.take_kind(TokenKind::OpenRange).is_some() {
             let start = lexer
-                .take_kind(TokenKind::Value(ValueKind::Nb))
+                .take_kind(TokenKind::Nb)
                 .map(|t| (t.span, t.str.parse::<u32>().ok()));
             let sep = lexer.take_kind(TokenKind::SepRange).is_some();
             let end = lexer
-                .take_kind(TokenKind::Value(ValueKind::Nb))
+                .take_kind(TokenKind::Nb)
                 .map(|t| (t.span, t.str.parse::<u32>().ok()));
             let (start, end) = match (start, sep, end) {
                 (Some((span, None)), _, _) => return Err((span, "Expected a start index")),
@@ -286,7 +311,7 @@ impl Filter {
     fn parse_regex(&mut self, lexer: &mut Lexer) -> Result<(MatchOp, Range<u32>)> {
         Self::list(lexer, &mut self.regex, |lexer| {
             let token = lexer.next();
-            if token.kind == TokenKind::Value(ValueKind::Str) {
+            if token.kind == TokenKind::Str || token.kind == TokenKind::Id {
                 Regex::new(&token.str.trim_matches('"')).map_err(|_| (token.span, "Invalid regex"))
             } else {
                 Err((token.span, "Expected regex"))
@@ -298,27 +323,31 @@ impl Filter {
         Self::list(lexer, &mut self.values, |lexer| {
             let token = lexer.next();
             match token.kind {
-                TokenKind::Value(ValueKind::Nb) => Ok(Value::Nb(token.str.parse().unwrap())),
-                TokenKind::Value(ValueKind::Str) => Ok(Value::Str(token.span)),
+                TokenKind::Nb => Ok(Value::Nb(token.str.parse().unwrap())),
+                TokenKind::Str | TokenKind::Id => Ok(Value::Str(token.span)),
                 _ => Err((token.span, "Expected a value")),
             }
         })
     }
-
-    fn parse_action(&mut self, lexer: &mut Lexer) -> Result<u32> {
+    fn parse_id(&mut self, lexer: &mut Lexer) -> Result<u32> {
         let token = lexer.next();
-        let id = if token.kind == TokenKind::Value(ValueKind::Nb) {
-            if let Ok(nb) = token.str.parse::<u32>() {
-                nb
-            } else {
-                return Err((token.span, "Wrong id format"));
+        let id = match token.kind {
+            TokenKind::Nb => {
+                if let Some(nb) = token.str.parse::<u32>().ok().filter(|nb| nb > &0) {
+                    Id::Idx(nb)
+                } else {
+                    return Err((token.span, "Expected an integer > 0"));
+                }
             }
-        } else {
-            return Err((token.span, "Expected id"));
+            TokenKind::Str | TokenKind::Id => Id::Name(token.span),
+            _ => return Err((token.span, "Expected an id")),
         };
         let range = self.parse_range(lexer)?;
-        let id = Self::add(&mut self.idx, (id, range));
+        Ok(Self::add(&mut self.idx, (id, range)))
+    }
 
+    fn parse_action(&mut self, lexer: &mut Lexer) -> Result<u32> {
+        let id = self.parse_id(lexer)?;
         let token = lexer.peek();
         let node = match token.kind {
             TokenKind::Matches => {

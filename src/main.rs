@@ -1,6 +1,6 @@
 use std::{
     io::{self, Seek},
-    ops::Add,
+    ops::{Add, Range},
     sync::Arc,
     thread,
     time::{Duration, Instant, SystemTime},
@@ -10,14 +10,14 @@ use bstr::{BStr, ByteSlice};
 use filter::{Engine, Filter, Highlighter, Style};
 use fmt::{fmt_field, rtrim, ColStat, FmtBuffer, Ty};
 use parking_lot::Mutex;
+use prompt::{Prompt, PromptCmd};
 use read::{Config, CsvReader, NestedString};
 use spinner::Spinner;
-use style::grey;
 use tui::{
     crossterm::event::{self, Event, KeyCode},
     none,
     unicode_width::UnicodeWidthChar,
-    Color, Terminal,
+    Canvas, Color, Line, Terminal,
 };
 
 mod filter;
@@ -25,6 +25,128 @@ mod fmt;
 mod read;
 mod spinner;
 mod style;
+mod prompt {
+    use reedline::LineBuffer;
+
+    struct HistoryBuffer<T, const N: usize> {
+        ring: [T; N],
+        head: usize,
+        filled: bool,
+    }
+
+    impl<T: Default, const N: usize> HistoryBuffer<T, N> {
+        pub fn new() -> Self {
+            Self {
+                ring: std::array::from_fn(|_| T::default()),
+                head: 0,
+                filled: false,
+            }
+        }
+
+        pub fn push(&mut self, item: T) {
+            self.ring[self.head] = item;
+            if self.head + 1 == self.ring.len() {
+                self.filled = true;
+            }
+            self.head = (self.head + 1) % self.ring.len();
+        }
+
+        pub fn get(&self, idx: usize) -> &T {
+            assert!(idx <= self.ring.len() && self.len() > 0);
+            let pos = (self.ring.len() + self.head - idx - 1) % self.ring.len();
+            &self.ring[pos]
+        }
+
+        pub fn len(&self) -> usize {
+            if self.filled {
+                self.ring.len()
+            } else {
+                self.head
+            }
+        }
+    }
+
+    pub struct Prompt {
+        history: HistoryBuffer<String, 5>,
+        pos: Option<usize>,
+        buffer: LineBuffer,
+    }
+
+    impl Prompt {
+        pub fn new() -> Self {
+            Self {
+                history: HistoryBuffer::new(),
+                pos: None,
+                buffer: LineBuffer::new(),
+            }
+        }
+
+        /// Ensure buffer contains the right data
+        fn solidify(&mut self) {
+            if let Some(pos) = self.pos.take() {
+                self.buffer.clear();
+                self.buffer.insert_str(self.history.get(pos));
+            }
+        }
+
+        pub fn exec(&mut self, cmd: PromptCmd) {
+            match cmd {
+                PromptCmd::Write(c) => {
+                    self.solidify();
+                    self.buffer.insert_char(c);
+                }
+                PromptCmd::Left => {
+                    self.solidify();
+                    self.buffer.move_left();
+                }
+                PromptCmd::Right => {
+                    self.solidify();
+                    self.buffer.move_right()
+                }
+                PromptCmd::Delete => {
+                    self.solidify();
+                    self.buffer.delete_left_grapheme();
+                }
+                PromptCmd::Prev => match &mut self.pos {
+                    Some(pos) if *pos + 1 < self.history.len() => *pos += 1,
+                    None if self.history.len() > 0 => self.pos = Some(0),
+                    _ => {}
+                },
+                PromptCmd::Next => match &mut self.pos {
+                    Some(0) => self.pos = None,
+                    Some(pos) => *pos = pos.saturating_sub(1),
+                    None => {}
+                },
+                PromptCmd::New => {
+                    let (str, _) = self.state();
+                    self.history.push(str.into());
+                    self.pos = None;
+                    self.buffer.clear();
+                }
+            }
+        }
+
+        pub fn state(&self) -> (&str, usize) {
+            match self.pos {
+                Some(pos) => {
+                    let str = self.history.get(pos);
+                    (str, str.len())
+                }
+                None => (self.buffer.get_buffer(), self.buffer.insertion_point()),
+            }
+        }
+    }
+
+    pub enum PromptCmd {
+        Write(char),
+        Left,
+        Right,
+        Prev,
+        Next,
+        New,
+        Delete,
+    }
+}
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -63,6 +185,105 @@ impl FileWatcher {
     }
 }
 
+pub struct FilterPrompt {
+    prompt: Prompt,
+    offset: usize,
+    err: Option<(Range<usize>, &'static str)>,
+}
+
+impl FilterPrompt {
+    pub fn new() -> Self {
+        Self {
+            prompt: Prompt::new(),
+            offset: 0,
+            err: None,
+        }
+    }
+
+    pub fn on_key(&mut self, code: KeyCode) -> Option<Arc<Filter>> {
+        self.err = None;
+        match code {
+            KeyCode::Char(c) => self.prompt.exec(PromptCmd::Write(c)),
+            KeyCode::Left => self.prompt.exec(PromptCmd::Left),
+            KeyCode::Right => self.prompt.exec(PromptCmd::Right),
+            KeyCode::Up => self.prompt.exec(PromptCmd::Prev),
+            KeyCode::Down => self.prompt.exec(PromptCmd::Next),
+            KeyCode::Backspace => self.prompt.exec(PromptCmd::Delete),
+            KeyCode::Enter => {
+                let (str, _) = self.prompt.state();
+                match Filter::compile(str.into()) {
+                    Ok(filter) => {
+                        self.prompt.exec(PromptCmd::New);
+                        return Some(filter);
+                    }
+                    Err(err) => self.err = Some(err),
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    pub fn draw(&mut self, c: &mut Canvas) {
+        let mut l = c.btm();
+        l.draw("$ ", none().fg(Color::DarkGrey));
+        let (str, cursor) = self.prompt.state();
+        let mut highlighter = Highlighter::new(str);
+        let mut pending_cursor = true;
+        for (i, c) in str.char_indices() {
+            if pending_cursor && cursor <= i {
+                l.cursor();
+                pending_cursor = false
+            }
+            l.draw(
+                c,
+                match highlighter.style(i) {
+                    Style::None | Style::Logi => none(),
+                    Style::Id => none().fg(Color::Blue),
+                    Style::Nb => none().fg(Color::Yellow),
+                    Style::Str => none().fg(Color::Green),
+                    Style::Regex => none().fg(Color::Magenta),
+                    Style::Action => none().fg(Color::Red),
+                },
+            );
+        }
+        if pending_cursor {
+            l.cursor();
+        }
+        if let Some((range, msg)) = &self.err {
+            c.btm().draw(
+                format_args!(
+                    "{s:<0$}{s:▾<1$} {msg}",
+                    range.start + 2,
+                    range.len(),
+                    s = ""
+                ),
+                none().fg(Color::Red),
+            );
+        }
+    }
+
+    pub fn draw_filter(l: &mut Line, filter: &str) {
+        let mut highlighter = Highlighter::new(filter);
+        for (i, c) in filter.char_indices() {
+            if l.width() == 0 {
+                return;
+            }
+            l.draw(
+                c,
+                match highlighter.style(i) {
+                    Style::None | Style::Logi => none(),
+                    Style::Id => none().fg(Color::Blue),
+                    Style::Nb => none().fg(Color::Yellow),
+                    Style::Str => none().fg(Color::Green),
+                    Style::Regex => none().fg(Color::Magenta),
+                    Style::Action => none().fg(Color::Red),
+                },
+            );
+        }
+    }
+}
+
 fn main() {
     let path = std::env::args()
         .nth(1)
@@ -70,11 +291,12 @@ fn main() {
     let mut app = App::open(path.clone()).unwrap();
     let mut watcher = FileWatcher::new(path).unwrap();
     let mut redraw = true;
+    let mut terminal = Terminal::new(io::stdout()).unwrap();
     loop {
         // Check loading state before drawing to no skip completed task during drawing
         let is_loading = app.is_loading();
         if redraw {
-            app.draw();
+            terminal.draw(|c| app.draw(c)).unwrap();
             redraw = false;
         }
         if event::poll(Duration::from_millis(250)).unwrap() {
@@ -199,17 +421,18 @@ impl Nav {
 }
 
 struct App {
-    terminal: Terminal,
     config: Config,
     rdr: CsvReader,
     grid: Grid,
     nav: Nav,
-    index: Indexer,
+    indexer: Indexer,
     spinner: Spinner,
     fmt_buff: FmtBuffer,
     dirty: bool,
-    filter: Option<String>,
     err: String,
+    // Filter prompt
+    focus_filter_prompt: bool,
+    filter_prompt: FilterPrompt,
 }
 
 impl App {
@@ -217,30 +440,31 @@ impl App {
         let (config, rdr) = Config::sniff(path)?;
         let index = Indexer::index(&config, Filter::empty())?;
         Ok(Self {
-            terminal: Terminal::new(io::stdout())?,
             rdr,
             config,
-            index,
+            indexer: index,
             grid: Grid::new(),
             nav: Nav::new(),
             spinner: Spinner::new(),
             fmt_buff: FmtBuffer::new(),
             dirty: false,
-            filter: None,
             err: String::new(),
+            // Filter prompt
+            focus_filter_prompt: false,
+            filter_prompt: FilterPrompt::new(),
         })
     }
 
     pub fn is_loading(&self) -> bool {
-        self.index.is_loading()
+        self.indexer.is_loading()
     }
 
     pub fn refresh(&mut self) {
         let (config, rdr) = Config::sniff(self.config.path.clone()).unwrap();
-        let index = Indexer::index(&config, self.index.filter.clone()).unwrap();
+        let index = Indexer::index(&config, self.indexer.filter.clone()).unwrap();
         self.config = config;
         self.rdr = rdr;
-        self.index = index;
+        self.indexer = index;
         self.grid = Grid::new();
         self.dirty = false;
     }
@@ -252,207 +476,174 @@ impl App {
     pub fn on_event(&mut self, event: Event) -> bool {
         if let Event::Key(event) = event {
             self.err.clear();
-            match &mut self.filter {
-                Some(filter) => match event.code {
-                    KeyCode::Esc => {
-                        self.filter = None;
-                        if !self.index.filter.source.is_empty() {
-                            self.index = Indexer::index(&self.config, Filter::empty()).unwrap()
-                        }
+            if self.focus_filter_prompt {
+                if let KeyCode::Esc = event.code {
+                    self.focus_filter_prompt = false;
+                } else {
+                    if let Some(filter) = self.filter_prompt.on_key(event.code) {
+                        self.indexer = Indexer::index(&self.config, filter).unwrap();
                     }
-                    KeyCode::Char(c) => filter.push(c),
-                    KeyCode::Backspace => {
-                        filter.pop();
-                    }
-                    KeyCode::Enter => match Filter::new(filter.clone()) {
-                        Ok(it) => self.index = Indexer::index(&self.config, it).unwrap(),
-                        Err((pos, msg)) => self.err = format!("at {pos:?}: {msg}"),
-                    },
+                }
+            } else {
+                match event.code {
+                    KeyCode::Char('q') => return true,
+                    KeyCode::Char('r') => self.refresh(),
+                    KeyCode::Left | KeyCode::Char('h') => self.nav.left(),
+                    KeyCode::Down | KeyCode::Char('j') => self.nav.down(),
+                    KeyCode::Up | KeyCode::Char('k') => self.nav.up(),
+                    KeyCode::Right | KeyCode::Char('l') => self.nav.right(),
+                    KeyCode::Char('/') => self.focus_filter_prompt = true,
                     _ => {}
-                },
-                None => {
-                    match event.code {
-                        KeyCode::Char('q') => return true,
-                        KeyCode::Char('r') => self.refresh(),
-                        _ => {}
-                    }
-                    match event.code {
-                        KeyCode::Left | KeyCode::Char('h') => self.nav.left(),
-                        KeyCode::Down | KeyCode::Char('j') => self.nav.down(),
-                        KeyCode::Up | KeyCode::Char('k') => self.nav.up(),
-                        KeyCode::Right | KeyCode::Char('l') => self.nav.right(),
-                        KeyCode::Char('/') => self.filter = Some(String::new()),
-                        _ => {}
-                    }
                 }
             }
         }
         false
     }
 
-    pub fn draw(&mut self) {
-        let Self {
-            terminal,
-            rdr,
-            grid,
-            nav,
-            index,
-            spinner,
-            config,
-            fmt_buff,
-            ..
-        } = self;
+    pub fn draw(&mut self, c: &mut Canvas) {
+        let w = c.width();
+        // Draw error bar
+        if self.dirty {
+            let msg = "File content have changed, press 'r' to refresh";
+            c.top()
+                .draw(format_args!("{msg:^0$}", w), none().fg(Color::Red));
+        } else if !self.err.is_empty() {
+            c.top()
+                .draw(format_args!("{:^1$}", self.err, w), none().fg(Color::Red));
+        }
 
-        terminal
-            .draw(|c| {
-                let w = c.width();
-                // Draw error bar
-                if self.dirty {
-                    let msg = "File content have changed, press 'r' to refresh";
-                    c.top()
-                        .draw(format_args!("{msg:^0$}", w), none().fg(Color::Red));
-                } else if !self.err.is_empty() {
-                    c.top()
-                        .draw(format_args!("{:^1$}", self.err, w), none().fg(Color::Red));
-                }
-
-                // Sync state with indexer
-                let nb_row = index.nb_row();
-                let is_loading = index.is_loading();
-                // Get rows content
-                let nb_draw_row = c.height().saturating_sub(2);
-                let row_off = nav.row_offset(nb_row, nb_draw_row);
-                let offsets = index.get_offsets(row_off..row_off + nb_draw_row);
-                grid.read_rows(&offsets, rdr).unwrap();
-                let rows = grid.rows();
-                let nb_col = rows
+        // Sync state with indexer
+        let nb_row = self.indexer.nb_row();
+        let is_loading = self.indexer.is_loading();
+        // Get rows content
+        let nb_draw_row = c.height().saturating_sub(2);
+        let row_off = self.nav.row_offset(nb_row, nb_draw_row);
+        let offsets = self.indexer.get_offsets(row_off..row_off + nb_draw_row);
+        self.grid.read_rows(&offsets, &mut self.rdr).unwrap();
+        let rows = self.grid.rows();
+        let nb_col = rows
+            .iter()
+            .map(|(_, n)| n.len())
+            .chain([self.indexer.headers.len()])
+            .max()
+            .unwrap_or(0);
+        let id_len = rows
+            .last()
+            .map(|(i, _)| (*i as f32 + 1.).log10() as usize + 1)
+            .unwrap_or(1);
+        let mut col_offset_iter = self.nav.col_iter(nb_col);
+        let mut remaining_width = c.width() - id_len as usize - 1;
+        let mut cols = Vec::new();
+        while remaining_width > cols.len() {
+            if let Some(offset) = col_offset_iter.next() {
+                let (fields, mut stat) = rows
                     .iter()
-                    .map(|(_, n)| n)
-                    .chain(index.headers.iter())
-                    .map(|n| n.len())
-                    .max()
-                    .unwrap_or(0);
-                let id_len = rows
-                    .last()
-                    .map(|(i, _)| (*i as f32).log10() as usize + 1)
-                    .unwrap_or(1);
-                let mut col_offset_iter = nav.col_iter(nb_col);
-                let mut remaining_width = c.width() - id_len as usize - 1;
-                let mut cols = Vec::new();
-                while remaining_width > cols.len() {
-                    if let Some(offset) = col_offset_iter.next() {
-                        let (fields, mut stat) = rows
-                            .iter()
-                            .map(|(_, n)| n.get(offset).unwrap_or_default())
-                            .fold(
-                                (Vec::new(), ColStat::new()),
-                                |(mut vec, mut stat), content| {
-                                    let ty = Ty::guess(content);
-                                    stat.add(&ty, content);
-                                    vec.push((ty, content));
-                                    (vec, stat)
-                                },
-                            );
-                        if let Some(headers) = &index.headers {
-                            stat.header_name(headers.get(offset).unwrap_or_else(|| BStr::new("?")));
-                        } else {
-                            stat.header_idx(offset + 1);
-                        }
-                        let allowed = stat.budget().min(remaining_width - cols.len());
-                        remaining_width = remaining_width.saturating_sub(allowed);
-                        cols.push((offset, fields, stat, allowed));
-                    } else {
-                        break;
-                    }
-                }
-                cols.sort_unstable_by_key(|(i, _, _, _)| *i); // Find a way to store col in order
-                drop(col_offset_iter);
-
-                // Draw status bar
-                let mut l = c.btm();
-                if let Some(filter) = &self.filter {
-                    l.draw("filter: ", none());
-                    for win in Highlighter::new(filter).styles.windows(2) {
-                        match win {
-                            [(start, _), (end, style)] => {
-                                l.draw(
-                                    &filter[*start..*end],
-                                    match style {
-                                        Style::None => none(),
-                                        Style::Id => none().fg(Color::Blue),
-                                        Style::Nb => none().fg(Color::Yellow),
-                                        Style::Str => none().fg(Color::Green),
-                                        Style::Regex => none().fg(Color::Magenta),
-                                        Style::Action => none().fg(Color::Red),
-                                        Style::Logi => none().fg(Color::Cyan),
-                                    },
-                                );
-                            }
-                            _ => unreachable!(),
-                        }
-                    }
-                    l.cursor();
+                    .map(|(_, n)| n.get(offset).unwrap_or_default())
+                    .fold(
+                        (Vec::new(), ColStat::new()),
+                        |(mut vec, mut stat), content| {
+                            let ty = Ty::guess(content);
+                            stat.add(&ty, content);
+                            vec.push((ty, content));
+                            (vec, stat)
+                        },
+                    );
+                if let Some(name) = self.indexer.headers.get(offset) {
+                    stat.header_name(name);
                 } else {
-                    if let Some(char) = spinner.state(is_loading) {
-                        l.rdraw(char, none().fg(Color::Green));
-                    }
-                    l.rdraw(fmt::quantity(fmt_buff, nb_row), none());
-                    l.rdraw(':', grey());
-                    l.rdraw(fmt::quantity(fmt_buff, nb_col), none());
-                    l.rdraw('|', grey());
-                    l.rdraw(fmt::quantity(fmt_buff, nav.o_row + 1), none());
-                    l.rdraw(':', grey());
-                    l.rdraw(fmt::quantity(fmt_buff, nav.cursor_col() + 1), none());
-                    l.rdraw(' ', none());
-                    l.draw(&config.path, none().fg(Color::Green));
+                    stat.header_idx(offset + 1);
                 }
+                let allowed = stat.budget().min(remaining_width - cols.len());
+                remaining_width = remaining_width.saturating_sub(allowed);
+                cols.push((offset, fields, stat, allowed));
+            } else {
+                break;
+            }
+        }
+        cols.sort_unstable_by_key(|(i, _, _, _)| *i); // Find a way to store col in order
+        drop(col_offset_iter);
 
-                // Draw headers
-                {
-                    let line = &mut c.top();
-                    line.draw(
-                        format_args!("{:>1$} ", '#', id_len),
-                        none().fg(Color::DarkGrey).bold(),
-                    );
+        // Draw status bar
+        let mut l = c.btm();
+        if self.focus_filter_prompt || !self.indexer.filter.source.is_empty() {
+            l.draw(" FILTER ", none().bg(Color::Magenta).bold());
+        } else {
+            l.draw(" NORMAL ", none().bg(Color::DarkGrey).bold());
+        }
+        if let Some(char) = self.spinner.state(is_loading) {
+            l.rdraw(char, none().fg(Color::Green));
+        }
+        l.rdraw(
+            fmt::quantity(&mut self.fmt_buff, self.nav.c_row + 1),
+            none(),
+        );
+        l.rdraw(':', none());
+        l.rdraw(
+            fmt::quantity(&mut self.fmt_buff, self.nav.cursor_col() + 1),
+            none(),
+        );
+        l.rdraw(" ", none());
+        l.rdraw(
+            format_args!(" {:>3}%", ((self.nav.c_row + 1) * 100) / nb_row.max(1)),
+            none(),
+        );
+        l.draw(" ", none());
+        if !self.indexer.filter.source.is_empty() {
+            FilterPrompt::draw_filter(&mut l, &self.indexer.filter.source);
+        } else {
+            l.draw(&self.config.path, none().fg(Color::Green));
+        }
 
-                    for (i, _, _, budget) in &cols {
-                        let header = if let Some(header) = &index.headers {
-                            let name = header.get(*i).unwrap_or_else(|| BStr::new("?"));
-                            rtrim(name, fmt_buff, *budget)
-                        } else {
-                            rtrim(*i + 1, fmt_buff, *budget)
-                        };
-                        let style = if *i == nav.cursor_col() {
-                            style::reverse(none().bold())
-                        } else {
-                            none().bold()
-                        };
-                        line.draw(format_args!("{header:<0$} ", budget), style);
-                    }
-                }
+        if self.focus_filter_prompt {
+            self.filter_prompt.draw(c);
+        }
 
-                // Draw rows
-                for (i, (e, _)) in rows.iter().enumerate() {
-                    let style = if i == nav.cursor_row() {
-                        style::reverse(none())
-                    } else {
-                        none()
-                    };
-                    let line = &mut c.top();
-                    line.draw(
-                        format_args!("{:>1$} ", *e, id_len),
-                        none().fg(Color::DarkGrey),
-                    );
-                    for (_, fields, stat, budget) in &cols {
-                        let (ty, str) = fields[i];
-                        line.draw(
-                            format_args!("{} ", fmt_field(fmt_buff, &ty, str, stat, *budget)),
-                            style,
-                        );
-                    }
-                }
-            })
-            .unwrap();
+        // Draw headers
+        {
+            let line = &mut c.top();
+            line.draw(
+                format_args!("{:>1$} ", '#', id_len),
+                none().fg(Color::DarkGrey).bold(),
+            );
+
+            for (i, _, _, budget) in &cols {
+                let header = if let Some(name) = self.indexer.headers.get(*i) {
+                    rtrim(name, &mut self.fmt_buff, *budget)
+                } else {
+                    rtrim(*i + 1, &mut self.fmt_buff, *budget)
+                };
+                let style = if *i == self.nav.cursor_col() {
+                    style::reverse(none().bold())
+                } else {
+                    none().bold()
+                };
+                line.draw(format_args!("{header:<0$} ", budget), style);
+            }
+        }
+
+        // Draw rows
+        for (i, (e, _)) in rows.iter().enumerate() {
+            let style = if i == self.nav.cursor_row() {
+                style::reverse(none())
+            } else {
+                none()
+            };
+            let line = &mut c.top();
+            line.draw(
+                format_args!("{:>1$} ", *e + 1, id_len),
+                none().fg(Color::DarkGrey),
+            );
+            for (_, fields, stat, budget) in &cols {
+                let (ty, str) = fields[i];
+                line.draw(
+                    format_args!(
+                        "{} ",
+                        fmt_field(&mut self.fmt_buff, &ty, str, stat, *budget)
+                    ),
+                    style,
+                );
+            }
+        }
     }
 }
 
@@ -505,7 +696,7 @@ struct IndexerState {
 }
 
 pub struct Indexer {
-    pub headers: Option<NestedString>,
+    pub headers: Arc<NestedString>,
     task: Arc<Mutex<IndexerState>>,
     filter: Arc<Filter>, // TODO show error
 }
@@ -513,18 +704,18 @@ pub struct Indexer {
 impl Indexer {
     pub fn index(config: &Config, filter: Arc<Filter>) -> io::Result<Self> {
         let mut rdr = config.reader()?;
-        let headers = if config.has_header {
-            let mut nested = NestedString::new();
-            rdr.record(&mut nested)?;
-            Some(nested)
-        } else {
-            None
-        };
+        let mut headers = NestedString::new();
+        if config.has_header {
+            rdr.record(&mut headers)?;
+        }
+        let headers = Arc::new(headers);
+
         let task = Arc::new(Mutex::new(IndexerState { index: vec![] }));
         {
             let task = task.clone();
             let filter = filter.clone();
-            thread::spawn(|| Self::bg_index(rdr, filter, task));
+            let headers = headers.clone();
+            thread::spawn(|| Self::bg_index(rdr, filter, headers, task));
         }
 
         Ok(Self {
@@ -537,10 +728,11 @@ impl Indexer {
     fn bg_index(
         mut rdr: CsvReader,
         filter: Arc<Filter>,
+        headers: Arc<NestedString>,
         task: Arc<Mutex<IndexerState>>,
     ) -> io::Result<()> {
         // Slower filtering indexer
-        let engine = Engine::new(&filter);
+        let engine = Engine::new(&filter, &headers);
         let mut record = NestedString::new();
         let mut pos = rdr.file.stream_position()?;
         let mut buff_pos = Vec::with_capacity(100);

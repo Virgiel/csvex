@@ -10,7 +10,6 @@ pub enum TokenKind {
     Cmp(CmpOp),
     Logi(LogiOp),
     Match(MatchOp),
-    Value(ValueKind),
     Matches,    // matches, ~,
     Not,        // not, !
     OpenExpr,   // (
@@ -21,7 +20,10 @@ pub enum TokenKind {
     OpenList,   // {
     CloseList,  // }
     SepList,    // ,
-    Id,
+    Nb,         // Decimal Number
+    Str,        // surrounded by "
+    Id,         // surrounded by whitespace
+    Err,
     Eof,
 }
 
@@ -39,12 +41,6 @@ pub enum CmpOp {
 pub enum LogiOp {
     And, // and, &&
     Or,  // or, ||
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ValueKind {
-    Nb,
-    Str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,18 +160,18 @@ impl<'a> Lexer<'a> {
                     let len = chars
                         .find_map(|(i, c)| (c == '"').then(|| i + 1))
                         .unwrap_or(remaining.len());
-                    self.token(TokenKind::Value(ValueKind::Str), len)
+                    self.token(TokenKind::Str, len)
                 }
                 c if c.is_ascii_digit() => {
                     let len = chars
                         .find_map(|(i, c)| (!c.is_ascii_digit()).then(|| i))
                         .unwrap_or(remaining.len());
-                    self.token(TokenKind::Value(ValueKind::Nb), len)
+                    self.token(TokenKind::Nb, len)
                 }
                 _ => {
                     // Search end of possible slice
                     let len = chars
-                        .find_map(|(i, c)| c.is_whitespace().then(|| i))
+                        .find_map(|(i, c)| (!c.is_alphanumeric()).then(|| i))
                         .unwrap_or(remaining.len());
                     let kind = match &remaining[..len] {
                         "eq" => TokenKind::Cmp(CmpOp::Eq),
@@ -192,7 +188,7 @@ impl<'a> Lexer<'a> {
                         "not" => TokenKind::Not,
                         str => {
                             if str.parse::<Decimal>().is_ok() {
-                                TokenKind::Value(ValueKind::Nb)
+                                TokenKind::Nb
                             } else {
                                 TokenKind::Id
                             }

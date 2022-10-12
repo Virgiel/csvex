@@ -7,7 +7,7 @@ use crate::read::NestedString;
 
 use super::{
     lexer::{CmpOp, LogiOp, MatchOp},
-    parser::{Filter, Node, Value},
+    parser::{Filter, Id, Node, Value},
 };
 
 pub fn in_place_str<const N: usize>(array: &mut [u8; N], it: impl Display) -> &str {
@@ -20,19 +20,28 @@ pub fn in_place_str<const N: usize>(array: &mut [u8; N], it: impl Display) -> &s
 
 pub struct Engine<'a> {
     filter: &'a Filter,
+    headers: &'a NestedString,
 }
 
 impl<'r> Engine<'r> {
-    pub fn new(filter: &'r Filter) -> Self {
-        Self { filter }
+    pub fn new(filter: &'r Filter, headers: &'r NestedString) -> Self {
+        Self { filter, headers }
     }
 
     fn by_id<'a>(&self, record: &'a NestedString, i: u32) -> &'a BStr {
-        let (idx, (start, end)) = self.filter.idx[i as usize];
-        let field = record.get(idx as usize).unwrap_or_default();
-        BStr::new(
-            &field[start.min(field.len() as u32) as usize..end.min(field.len() as u32) as usize],
-        )
+        let (idx, (start, end)) = &self.filter.idx[i as usize];
+        let idx = match idx {
+            Id::Idx(idx) => Some(*idx as usize - 1),
+            Id::Name(range) => {
+                let name = self.filter.source[range.clone()]
+                    .as_bytes()
+                    .trim_with(|c| c == '"');
+                let name = BStr::new(name);
+                self.headers.iter().position(|header| header == name)
+            }
+        };
+        let field = idx.and_then(|i| record.get(i)).unwrap_or_default();
+        BStr::new(&field[(*start as usize).min(field.len())..(*end as usize).min(field.len())])
     }
 
     fn cmp<T: Eq + Ord>(a: T, b: T, op: CmpOp) -> bool {
