@@ -78,7 +78,7 @@ impl FilterPrompt {
         }
     }
 
-    pub fn on_key(&mut self, code: KeyCode) -> Option<Filter> {
+    pub fn on_key(&mut self, code: KeyCode) -> Option<&str> {
         self.err = None;
         match code {
             KeyCode::Char(c) => self.prompt.exec(PromptCmd::Write(c)),
@@ -89,17 +89,19 @@ impl FilterPrompt {
             KeyCode::Backspace => self.prompt.exec(PromptCmd::Delete),
             KeyCode::Enter => {
                 let (str, _) = self.prompt.state();
-                match Filter::compile(str) {
-                    Ok(filter) => {
-                        self.prompt.exec(PromptCmd::New);
-                        return Some(filter);
-                    }
-                    Err(err) => self.err = Some(err),
-                }
+                return Some(str);
             }
             _ => {}
         }
         None
+    }
+
+    pub fn on_compile(&mut self) {
+        self.prompt.exec(PromptCmd::New);
+    }
+
+    pub fn on_error(&mut self, err: (Range<usize>, &'static str)) {
+        self.err.replace(err);
     }
 
     pub fn draw(&mut self, c: &mut Canvas) {
@@ -108,6 +110,7 @@ impl FilterPrompt {
         let (str, cursor) = self.prompt.state();
         let mut highlighter = Highlighter::new(str);
         let mut pending_cursor = true;
+
         for (i, c) in str.char_indices() {
             if pending_cursor && cursor <= i {
                 l.cursor();
@@ -339,11 +342,7 @@ impl App {
 
     pub fn refresh(&mut self) {
         let (config, rdr) = Config::sniff(self.config.path.clone()).unwrap();
-        let index = Indexer::index(
-            &config,
-            Filter::compile(self.indexer.filter().unwrap_or("")).unwrap(),
-        )
-        .unwrap();
+        let index = Indexer::index(&config, Filter::empty()).unwrap();
         self.config = config;
         self.rdr = rdr;
         self.indexer = index;
@@ -361,8 +360,15 @@ impl App {
             if self.focus_filter_prompt {
                 if let KeyCode::Esc = event.code {
                     self.focus_filter_prompt = false;
-                } else if let Some(filter) = self.filter_prompt.on_key(event.code) {
-                    self.indexer = Indexer::index(&self.config, filter).unwrap();
+                } else if let Some(source) = self.filter_prompt.on_key(event.code) {
+                    match Filter::new(source, self.indexer.headers(), self.indexer.nb_col()) {
+                        Ok(filter) => {
+                            self.indexer = Indexer::index(&self.config, filter).unwrap();
+                            self.focus_filter_prompt = false;
+                            self.filter_prompt.on_compile();
+                        }
+                        Err(err) => self.filter_prompt.on_error(err),
+                    }
                 }
             } else {
                 match event.code {
@@ -393,6 +399,7 @@ impl App {
         }
 
         // Sync state with indexer
+        let nb_col = self.indexer.nb_col();
         let nb_row = self.indexer.nb_row();
         let is_loading = self.indexer.is_loading();
         // Get rows content
@@ -401,12 +408,6 @@ impl App {
         let offsets = self.indexer.get_offsets(row_off..row_off + nb_draw_row);
         self.grid.read_rows(&offsets, &mut self.rdr).unwrap();
         let rows = self.grid.rows();
-        let nb_col = rows
-            .iter()
-            .map(|(_, n)| n.len())
-            .chain([self.indexer.headers().len()])
-            .max()
-            .unwrap_or(0);
         let id_len = rows
             .last()
             .map(|(i, _)| (*i as f32 + 1.).log10() as usize + 1)
@@ -451,7 +452,10 @@ impl App {
             l.draw(" NORMAL ", none().bg(Color::DarkGrey).bold());
         }
         if let Some(char) = self.spinner.state(is_loading) {
-            l.rdraw(char, none().fg(Color::Green));
+            l.rdraw(
+                format_args!("{:>3}%{char}", self.indexer.progress()),
+                none().fg(Color::Green),
+            );
         }
         l.rdraw(
             fmt::quantity(&mut self.fmt_buff, self.nav.c_row + 1),

@@ -10,8 +10,8 @@ use csv_core::ReadRecordResult;
 use crate::BUF_LEN;
 
 pub struct CsvReader {
-    pub file: BufReader<File>,
-    pub rdr: csv_core::Reader,
+    file: BufReader<File>,
+    rdr: csv_core::Reader,
 }
 
 impl CsvReader {
@@ -45,6 +45,14 @@ impl CsvReader {
         self.file.seek_relative(offset as i64 - pos as i64)?; // keep buffer if close to current position
         self.rdr.reset();
         Ok(())
+    }
+
+    pub fn pos(&mut self) -> io::Result<u64> {
+        self.file.stream_position()
+    }
+
+    pub fn len(&self) -> io::Result<u64> {
+        Ok(self.file.get_ref().metadata()?.len())
     }
 }
 
@@ -148,6 +156,12 @@ impl NestedString {
                 ReadRecordResult::OutputEndsFull => self.bounds.grow(),
                 ReadRecordResult::Record | ReadRecordResult::End => break,
             }
+        }
+        // Collapse empty column a the end
+        if self.bounds.len() > 2
+            && self.bounds[self.bounds.len() - 1] == self.bounds[self.bounds.len() - 2]
+        {
+            self.bounds.set_len(self.bounds.len() - 1)
         }
         Ok(nb_read)
     }

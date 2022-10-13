@@ -1,6 +1,9 @@
 use std::{
-    io::{self, Seek},
-    sync::Arc,
+    io::{self},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed},
+        Arc,
+    },
     thread,
 };
 
@@ -15,6 +18,9 @@ struct State {
     index: Mutex<Vec<(u32, u64)>>,
     headers: NestedString,
     filter: Filter,
+    file_len: u64,
+    nb_col: AtomicUsize,
+    nb_read: AtomicU64,
     // TODO store indexer error
 }
 
@@ -31,8 +37,11 @@ impl Indexer {
         }
         let state = Arc::new(State {
             index: Mutex::new(Vec::with_capacity(1000)),
-            headers,
             filter,
+            file_len: rdr.len()?,
+            nb_col: AtomicUsize::new(headers.len()),
+            nb_read: AtomicU64::new(rdr.pos()?),
+            headers,
         });
 
         {
@@ -44,11 +53,11 @@ impl Indexer {
     }
 
     fn bg_index(mut rdr: CsvReader, state: Arc<State>) -> io::Result<()> {
-        // Slower filtering indexer
-        let engine = Engine::new(&state.filter, &state.headers);
+        let engine = Engine::new(&state.filter);
         let mut record = NestedString::new();
-        let mut pos = rdr.file.stream_position()?;
         let mut buff_pos = Vec::with_capacity(100);
+        let mut pos = state.nb_read.load(Relaxed);
+        let mut max_col = state.nb_col.load(Relaxed);
 
         let mut count = 0;
         loop {
@@ -61,9 +70,10 @@ impl Indexer {
 
             pos += amount as u64;
             count += 1;
+            max_col = max_col.max(record.len());
 
             // Throttle locking
-            if count % 100 == 0 {
+            if count % 1000 == 0 {
                 // If arc is unique this task is canceled
                 if Arc::strong_count(&state) == 1 {
                     return Ok(());
@@ -71,6 +81,8 @@ impl Indexer {
                 if !buff_pos.is_empty() {
                     state.index.lock().append(&mut buff_pos);
                 }
+                state.nb_col.store(max_col, Relaxed);
+                state.nb_read.store(pos, Relaxed);
             }
         }
 
@@ -99,5 +111,13 @@ impl Indexer {
 
     pub fn headers(&self) -> &NestedString {
         &self.state.headers
+    }
+
+    pub fn nb_col(&self) -> usize {
+        self.state.nb_col.load(Relaxed)
+    }
+
+    pub fn progress(&self) -> u8 {
+        (self.state.nb_read.load(Relaxed) * 100 / self.state.file_len.max(1)) as u8
     }
 }

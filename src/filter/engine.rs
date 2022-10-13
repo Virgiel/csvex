@@ -6,8 +6,8 @@ use rust_decimal::Decimal;
 use crate::read::NestedString;
 
 use super::{
+    compiler::{Col, Filter, Node, Value},
     lexer::{CmpOp, LogiOp, MatchOp},
-    parser::{Filter, Id, Node, Value},
 };
 
 pub fn in_place_str<const N: usize>(array: &mut [u8; N], it: impl Display) -> &str {
@@ -20,27 +20,15 @@ pub fn in_place_str<const N: usize>(array: &mut [u8; N], it: impl Display) -> &s
 
 pub struct Engine<'a> {
     filter: &'a Filter,
-    headers: &'a NestedString,
 }
 
 impl<'r> Engine<'r> {
-    pub fn new(filter: &'r Filter, headers: &'r NestedString) -> Self {
-        Self { filter, headers }
+    pub fn new(filter: &'r Filter) -> Self {
+        Self { filter }
     }
 
-    fn by_id<'a>(&self, record: &'a NestedString, i: u32) -> &'a BStr {
-        let (idx, (start, end)) = &self.filter.idx[i as usize];
-        let idx = match idx {
-            Id::Idx(idx) => Some(*idx as usize - 1),
-            Id::Name(range) => {
-                let name = self.filter.source[range.clone()]
-                    .as_bytes()
-                    .trim_with(|c| c == '"');
-                let name = BStr::new(name);
-                self.headers.iter().position(|header| header == name)
-            }
-        };
-        let field = idx.and_then(|i| record.get(i)).unwrap_or_default();
+    fn get_col<'a>(&self, record: &'a NestedString, (idx, (start, end)): &Col) -> &'a BStr {
+        let field = record.get(*idx as usize).unwrap_or_default();
         BStr::new(&field[(*start as usize).min(field.len())..(*end as usize).min(field.len())])
     }
 
@@ -79,12 +67,12 @@ impl<'r> Engine<'r> {
     fn compare(
         &self,
         record: &NestedString,
-        id_i: u32,
+        col: &Col,
         op: CmpOp,
         m: MatchOp,
         range: Range<u32>,
     ) -> bool {
-        let str = self.by_id(record, id_i);
+        let str = self.get_col(record, col);
         let mut values = self.filter.values[range.start as usize..range.end as usize].iter();
         match m {
             MatchOp::All => values.all(|value| Self::check_action(self, str, op, value)),
@@ -92,8 +80,8 @@ impl<'r> Engine<'r> {
         }
     }
 
-    fn per_match(&self, record: &NestedString, id_i: u32, m: MatchOp, range: Range<u32>) -> bool {
-        let str = self.by_id(record, id_i);
+    fn per_match(&self, record: &NestedString, col: &Col, m: MatchOp, range: Range<u32>) -> bool {
+        let str = self.get_col(record, col);
         let mut regs = self.filter.regex[range.start as usize..range.end as usize].iter();
         match m {
             MatchOp::All => regs.all(|value| value.is_match(str)),
@@ -103,9 +91,9 @@ impl<'r> Engine<'r> {
 
     fn run_node(&self, record: &NestedString, i: u32) -> bool {
         match &self.filter.nodes[i as usize] {
-            Node::Exist(i) => !self.by_id(record, *i).is_empty(),
-            Node::Cmp { id, op, m, range } => self.compare(record, *id, *op, *m, range.clone()),
-            Node::Match { id, m, range } => self.per_match(record, *id, *m, range.clone()),
+            Node::Exist(col) => !self.get_col(record, col).is_empty(),
+            Node::Cmp { col, op, m, range } => self.compare(record, col, *op, *m, range.clone()),
+            Node::Match { col, m, range } => self.per_match(record, col, *m, range.clone()),
             Node::Unary(inverse, id) => {
                 let result = self.run_node(record, *id);
                 if *inverse {

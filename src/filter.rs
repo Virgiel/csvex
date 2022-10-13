@@ -1,6 +1,6 @@
 mod engine;
 mod lexer;
-mod parser;
+mod compiler;
 
 pub use engine::Engine;
-pub use parser::{Highlighter, Style, Filter};
+pub use compiler::{Highlighter, Style, Filter};

@@ -73,10 +73,6 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    pub fn offset(&self) -> usize {
-        self.offset
-    }
-
     pub fn next(&mut self) -> Token<'a> {
         self.peeked.take().unwrap_or_else(|| self.lex_next())
     }

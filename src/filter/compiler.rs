@@ -3,21 +3,24 @@ use std::ops::Range;
 use regex::bytes::Regex;
 use rust_decimal::Decimal;
 
-use super::lexer::{CmpOp, Lexer, LogiOp, MatchOp, TokenKind};
+use crate::read::NestedString;
+
+use super::lexer::{CmpOp, Lexer, LogiOp, MatchOp, Token, TokenKind};
 
 type Result<T> = std::result::Result<T, (Range<usize>, &'static str)>;
+pub type Col = (u32, (u32, u32));
 
 pub enum Node {
     // Action
-    Exist(u32),
+    Exist(Col),
     Cmp {
-        id: u32,
+        col: Col,
         op: CmpOp,
         m: MatchOp,
         range: Range<u32>,
     },
     Match {
-        id: u32,
+        col: Col,
         m: MatchOp,
         range: Range<u32>,
     },
@@ -33,11 +36,6 @@ pub enum Node {
 pub enum Value {
     Nb(Decimal),
     Str(Range<usize>),
-}
-
-pub enum Id {
-    Idx(u32),
-    Name(Range<usize>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -193,38 +191,39 @@ impl Highlighter {
     }
 }
 
-pub struct Filter {
-    pub(crate) values: Vec<Value>,
-    pub(crate) regex: Vec<Regex>,
-    pub(crate) idx: Vec<(Id, (u32, u32))>,
-    pub(crate) nodes: Vec<Node>,
-    pub(crate) source: String,
-    pub(crate) start: u32,
+struct Compiler<'a> {
+    filter: Filter,
+    lexer: Lexer<'a>,
+    headers: &'a NestedString,
+    nb_col: usize,
 }
 
-impl Filter {
-    pub fn empty() -> Self {
-        Self::compile("").unwrap()
-    }
-
-    pub fn compile(source: &str) -> Result<Self> {
+impl<'a> Compiler<'a> {
+    fn compile(source: &'a str, headers: &'a NestedString, nb_col: usize) -> Result<Filter> {
         let source = source.trim();
-        let mut tmp = Self {
-            values: vec![],
-            regex: vec![],
-            idx: vec![],
-            nodes: vec![],
-            source: String::new(),
-            start: 0,
+        let mut compiler = Self {
+            filter: Filter::empty(),
+            lexer: Lexer::load(source),
+            headers,
+            nb_col,
         };
-        let mut lexer = Lexer::load(source);
-        if lexer.peek().kind != TokenKind::Eof {
-            let start = tmp.parse_expr(&mut lexer)?;
-            tmp.start = start;
+
+        if compiler.lexer.peek().kind != TokenKind::Eof {
+            let start = compiler.parse_expr()?;
+            compiler.filter.start = start;
         }
 
-        tmp.source = source.to_string();
-        Ok(tmp)
+        compiler.filter.source = source.to_string();
+        Ok(compiler.filter)
+    }
+
+    fn expect(&mut self, kind: TokenKind, msg: &'static str) -> Result<Token> {
+        let token = self.lexer.next();
+        if token.kind != kind {
+            Err((token.span, msg))
+        } else {
+            Ok(token)
+        }
     }
 
     fn add<T>(vec: &mut Vec<T>, value: T) -> u32 {
@@ -232,37 +231,22 @@ impl Filter {
         (vec.len() - 1) as u32
     }
 
-    fn parse_range(&mut self, lexer: &mut Lexer) -> Result<(u32, u32)> {
-        if lexer.take_kind(TokenKind::OpenRange).is_some() {
-            let start = lexer
-                .take_kind(TokenKind::Nb)
-                .map(|t| (t.span, t.str.parse::<u32>().ok()));
-            let sep = lexer.take_kind(TokenKind::SepRange).is_some();
-            let end = lexer
-                .take_kind(TokenKind::Nb)
-                .map(|t| (t.span, t.str.parse::<u32>().ok()));
-            let (start, end) = match (start, sep, end) {
-                (Some((span, None)), _, _) => return Err((span, "Expected a start index")),
-                (_, _, Some((span, None))) => return Err((span, "Expected an end index")),
-                (Some((start, _)), false, Some((end, _))) => {
-                    return Err((start.start..end.end, "Missing span between index range"))
-                }
-                (Some((_, Some(start))), false, None) => (start, start),
-                (Some((_, Some(start))), true, None) => (start, u32::MAX),
-                (None, true, Some((_, Some(end)))) => (0, end),
-                (Some((start_span, Some(start))), true, Some((end_span, Some(end)))) => {
-                    if start <= end {
-                        (start, end)
-                    } else {
-                        return Err((start_span.start..end_span.end, "Expected start < end"));
-                    }
-                }
-                (None, true, None) => (0, u32::MAX),
-                _ => return Err((lexer.offset()..lexer.offset(), "Expected range")),
-            };
-            if lexer.take_kind(TokenKind::CloseRange).is_none() {
-                return Err((lexer.offset()..lexer.offset(), "Expected ]"));
-            }
+    fn parse_range(&mut self) -> Result<(u32, u32)> {
+        let token = self.lexer.peek();
+        if token.kind == TokenKind::OpenRange {
+            self.lexer.next();
+            let token = self.lexer.next();
+            let start = token
+                .str
+                .parse::<u32>()
+                .map_err(|_| (token.span, "Expect range start"))?;
+            self.expect(TokenKind::SepRange, "Expect :")?;
+            let token = self.lexer.next();
+            let end = token
+                .str
+                .parse::<u32>()
+                .map_err(|_| (token.span, "Expect range end"))?;
+            self.expect(TokenKind::CloseRange, "Expect ]")?;
             Ok((start, end))
         } else {
             Ok((0, u32::MAX))
@@ -282,10 +266,12 @@ impl Filter {
             }
             _ => None,
         };
-        let is_list = if lexer.take_kind(TokenKind::OpenList).is_some() {
+        let token = lexer.peek();
+        let is_list = if token.kind == TokenKind::OpenList {
+            lexer.next();
             true
         } else if match_op.is_some() {
-            return Err((lexer.offset()..lexer.offset(), "Expected {"));
+            return Err((token.span.clone(), "Expect {"));
         } else {
             false
         };
@@ -296,106 +282,132 @@ impl Filter {
         while lexer.take_kind(TokenKind::SepList).is_some() {
             end = Self::add(vec, parse(lexer)?);
         }
-
-        if is_list && lexer.take_kind(TokenKind::CloseList).is_none() {
-            return Err((lexer.offset()..lexer.offset(), "Expected }"));
+        if is_list {
+            let token = lexer.next();
+            if token.kind != TokenKind::CloseList {
+                return Err((token.span, "Expect }"));
+            }
         }
 
         Ok((match_op.unwrap_or(MatchOp::All), start..end + 1))
     }
 
-    fn parse_regex(&mut self, lexer: &mut Lexer) -> Result<(MatchOp, Range<u32>)> {
-        Self::list(lexer, &mut self.regex, |lexer| {
+    fn parse_regex(&mut self) -> Result<(MatchOp, Range<u32>)> {
+        Self::list(&mut self.lexer, &mut self.filter.regex, |lexer| {
             let token = lexer.next();
             if token.kind == TokenKind::Str || token.kind == TokenKind::Id {
                 Regex::new(token.str.trim_matches('"')).map_err(|_| (token.span, "Invalid regex"))
             } else {
-                Err((token.span, "Expected regex"))
+                Err((token.span, "Expect regex"))
             }
         })
     }
 
-    fn parse_value(&mut self, lexer: &mut Lexer) -> Result<(MatchOp, Range<u32>)> {
-        Self::list(lexer, &mut self.values, |lexer| {
+    fn parse_value(&mut self) -> Result<(MatchOp, Range<u32>)> {
+        Self::list(&mut self.lexer, &mut self.filter.values, |lexer| {
             let token = lexer.next();
             match token.kind {
                 TokenKind::Nb => Ok(Value::Nb(token.str.parse().unwrap())),
                 TokenKind::Str | TokenKind::Id => Ok(Value::Str(token.span)),
-                _ => Err((token.span, "Expected a value")),
+                _ => Err((token.span, "Expect a value")),
             }
         })
     }
-    fn parse_id(&mut self, lexer: &mut Lexer) -> Result<u32> {
-        let token = lexer.next();
+    fn parse_col(&mut self) -> Result<Col> {
+        let token = self.lexer.next();
         let id = match token.kind {
             TokenKind::Nb => {
-                if let Some(nb) = token.str.parse::<u32>().ok().filter(|nb| nb > &0) {
-                    Id::Idx(nb)
+                if let Ok(nb) = token.str.parse::<u32>() {
+                    if nb == 0 {
+                        return Err((token.span, "Column index are > 0"));
+                    } else if nb > self.nb_col as u32 {
+                        return Err((token.span, "No column with this index"));
+                    } else {
+                        nb - 1
+                    }
                 } else {
-                    return Err((token.span, "Expected an integer > 0"));
+                    return Err((token.span, "Expect a column index"));
                 }
             }
-            TokenKind::Str | TokenKind::Id => Id::Name(token.span),
-            _ => return Err((token.span, "Expected an id")),
+            TokenKind::Str | TokenKind::Id => {
+                let name = token.str.trim_matches('"');
+                match self.headers.iter().position(|header| header == name) {
+                    Some(i) => i as u32,
+                    None => return Err((token.span, "No column with this name")),
+                }
+            }
+            _ => return Err((token.span, "Expect an id")),
         };
-        let range = self.parse_range(lexer)?;
-        Ok(Self::add(&mut self.idx, (id, range)))
+        let range = self.parse_range()?;
+        Ok((id, range))
     }
 
-    fn parse_action(&mut self, lexer: &mut Lexer) -> Result<u32> {
-        let id = self.parse_id(lexer)?;
-        let token = lexer.peek();
+    fn parse_action(&mut self) -> Result<u32> {
+        let col = self.parse_col()?;
+        let token = self.lexer.peek();
         let node = match token.kind {
             TokenKind::Matches => {
-                lexer.next();
-                let (m, range) = self.parse_regex(lexer)?;
-                Node::Match { id, m, range }
+                self.lexer.next();
+                let (m, range) = self.parse_regex()?;
+                Node::Match { col, m, range }
             }
             TokenKind::Cmp(op) => {
-                lexer.next();
-                let (m, range) = self.parse_value(lexer)?;
-                Node::Cmp { id, op, m, range }
+                self.lexer.next();
+                let (m, range) = self.parse_value()?;
+                Node::Cmp { col, op, m, range }
             }
-            _ => Node::Exist(id),
+            _ => Node::Exist(col),
         };
-        Ok(Self::add(&mut self.nodes, node))
+        Ok(Self::add(&mut self.filter.nodes, node))
     }
 
-    fn parse_expr(&mut self, lexer: &mut Lexer) -> Result<u32> {
-        if lexer.take_kind(TokenKind::Not).is_some() {
-            let token = lexer.next();
-            if token.kind == TokenKind::OpenExpr {
-                let idx = self.parse_expr(lexer)?;
-                let token = lexer.next();
-                if token.kind == TokenKind::CloseExpr {
-                    Ok(Self::add(&mut self.nodes, Node::Unary(true, idx)))
-                } else {
-                    Err((token.span, "Expected )"))
-                }
-            } else {
-                Err((token.span, "Expected ("))
-            }
-        } else if lexer.take_kind(TokenKind::OpenExpr).is_some() {
-            let idx = self.parse_expr(lexer)?;
-            let token = lexer.next();
-            if token.kind == TokenKind::CloseExpr {
-                Ok(Self::add(&mut self.nodes, Node::Unary(true, idx)))
-            } else {
-                Err((token.span, "Expected )"))
-            }
+    fn parse_expr(&mut self) -> Result<u32> {
+        if self.lexer.take_kind(TokenKind::Not).is_some() {
+            self.expect(TokenKind::OpenExpr, "Expect (")?;
+            let idx = self.parse_expr()?;
+            self.expect(TokenKind::CloseExpr, "Expect )")?;
+            Ok(Self::add(&mut self.filter.nodes, Node::Unary(true, idx)))
+        } else if self.lexer.take_kind(TokenKind::OpenExpr).is_some() {
+            let idx = self.parse_expr()?;
+            self.expect(TokenKind::CloseExpr, "Expect )")?;
+            Ok(Self::add(&mut self.filter.nodes, Node::Unary(true, idx)))
         } else {
-            let lhs = self.parse_action(lexer)?;
-            let token = lexer.peek();
+            let lhs = self.parse_action()?;
+            let token = self.lexer.peek();
             let node = if let TokenKind::Logi(op) = token.kind {
-                lexer.next();
-                let rhs = self.parse_expr(lexer)?;
+                self.lexer.next();
+                let rhs = self.parse_expr()?;
                 Node::Binary { lhs, op, rhs }
             } else if TokenKind::Eof == token.kind {
                 Node::Unary(false, lhs)
             } else {
-                return Err((token.span.clone(), "Expected && or ||"));
+                return Err((token.span.clone(), "Expect && or ||"));
             };
-            Ok(Self::add(&mut self.nodes, node))
+            Ok(Self::add(&mut self.filter.nodes, node))
         }
+    }
+}
+
+pub struct Filter {
+    pub(crate) values: Vec<Value>,
+    pub(crate) regex: Vec<Regex>,
+    pub(crate) nodes: Vec<Node>,
+    pub(crate) source: String,
+    pub(crate) start: u32,
+}
+
+impl Filter {
+    pub fn empty() -> Self {
+        Self {
+            values: vec![],
+            regex: vec![],
+            nodes: vec![],
+            source: String::new(),
+            start: 0,
+        }
+    }
+
+    pub fn new(source: &str, headers: &NestedString, nb_col: usize) -> Result<Self> {
+        Compiler::compile(source, headers, nb_col)
     }
 }

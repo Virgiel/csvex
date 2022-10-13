@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-const SPINNER_TICK: Duration = Duration::from_millis(100);
+const SPINNER_TICK: Duration = Duration::from_millis(250);
 const SPINNERS_UNICODE: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 pub struct Spinner {
