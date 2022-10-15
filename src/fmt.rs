@@ -5,18 +5,33 @@ use tui::unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::BStrWidth;
 
-/// Buffer used by fmt functions
-pub type FmtBuffer = String;
+pub struct Quantity(u64);
 
-pub fn quantity(buff: &mut FmtBuffer, nb: usize) -> &str {
-    buff.clear();
-    write!(buff, "{nb}").unwrap();
-    let mut c = buff.len();
-    while c > 3 {
-        c -= 3;
-        buff.insert(c, '_');
+impl Display for Quantity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut nb = self.0;
+
+        const STEPS: [u64; 6] = [
+            1_000_000_000_000_000_000,
+            1_000_000_000_000_000,
+            1_000_000_000_000,
+            1_000_000_000,
+            1_000_000,
+            1_000,
+        ];
+
+        for step in STEPS {
+            if nb > step {
+                f.write_fmt(format_args!("{}_", nb / step))?;
+                nb = nb % step;
+            }
+        }
+        f.write_fmt(format_args!("{}", nb))
     }
-    buff
+}
+
+pub fn quantity(nb: usize) -> Quantity {
+    Quantity(nb as u64)
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -99,54 +114,61 @@ impl ColStat {
     }
 }
 
-pub fn fmt_field<'a>(
-    buff: &'a mut FmtBuffer,
-    ty: &Ty,
-    str: &BStr,
-    stat: &ColStat,
-    budget: usize,
-) -> &'a str {
-    buff.clear();
-    let pad = match ty {
-        Ty::Bool | Ty::Str if stat.align_decimal => {
-            for _ in 0..budget.saturating_sub(stat.max_lhs + stat.max_rhs) {
-                buff.write_char(' ').unwrap();
-            }
-            stat.max_lhs
-        }
-        Ty::Bool | Ty::Str => 0,
-        Ty::Nb { rhs, .. } => {
-            for _ in 0..budget.saturating_sub(stat.max_lhs + stat.max_rhs) {
-                buff.write_char(' ').unwrap();
-            }
-            stat.max_lhs + rhs
-        }
-    };
-    write!(buff, "{str:>0$}", pad).unwrap();
-    for _ in 0..budget.saturating_sub(buff.width()) {
-        buff.write_char(' ').unwrap();
-    }
-    trim_buffer(buff, budget)
+pub struct Fmt {
+    buff: String,
 }
 
-fn trim_buffer(buff: &mut FmtBuffer, budget: usize) -> &str {
-    let overflow = buff
-        .char_indices()
-        .into_iter()
-        .scan((0, 0), |(sum, prev), (mut pos, c)| {
-            std::mem::swap(prev, &mut pos);
-            *sum += c.width().unwrap_or(0);
-            Some((pos, *sum > budget))
-        })
-        .find_map(|(pos, overflow)| (overflow).then_some(pos));
-    if let Some(pos) = overflow {
-        buff.replace_range(pos.., "…");
+impl Fmt {
+    pub fn new() -> Self {
+        Self {
+            buff: String::new(),
+        }
     }
-    buff
-}
 
-pub fn rtrim(it: impl Display, buff: &mut FmtBuffer, budget: usize) -> &str {
-    buff.clear();
-    write!(buff, "{it}").unwrap();
-    trim_buffer(buff, budget)
+    pub fn rtrim(&mut self, it: impl Display, budget: usize) -> &str {
+        self.buff.clear();
+        write!(self.buff, "{it}").unwrap();
+        self.trim(budget)
+    }
+
+    pub fn field(&mut self, ty: &Ty, str: &BStr, stat: &ColStat, budget: usize) -> &str {
+        self.buff.clear();
+        let pad = match ty {
+            Ty::Bool | Ty::Str if stat.align_decimal => {
+                for _ in 0..budget.saturating_sub(stat.max_lhs + stat.max_rhs) {
+                    self.buff.write_char(' ').unwrap();
+                }
+                stat.max_lhs
+            }
+            Ty::Bool | Ty::Str => 0,
+            Ty::Nb { rhs, .. } => {
+                for _ in 0..budget.saturating_sub(stat.max_lhs + stat.max_rhs) {
+                    self.buff.write_char(' ').unwrap();
+                }
+                stat.max_lhs + rhs
+            }
+        };
+        write!(self.buff, "{str:>0$}", pad).unwrap();
+        for _ in 0..budget.saturating_sub(self.buff.width()) {
+            self.buff.write_char(' ').unwrap();
+        }
+        self.trim(budget)
+    }
+
+    fn trim(&mut self, budget: usize) -> &str {
+        let overflow = self
+            .buff
+            .char_indices()
+            .into_iter()
+            .scan((0, 0), |(sum, prev), (mut pos, c)| {
+                std::mem::swap(prev, &mut pos);
+                *sum += c.width().unwrap_or(0);
+                Some((pos, *sum > budget))
+            })
+            .find_map(|(pos, overflow)| (overflow).then_some(pos));
+        if let Some(pos) = overflow {
+            self.buff.replace_range(pos.., "…");
+        }
+        &self.buff
+    }
 }

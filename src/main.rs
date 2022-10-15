@@ -1,22 +1,22 @@
 use std::{
     io::{self},
-    ops::{Add, Range},
+    ops::Add,
     time::{Duration, Instant, SystemTime},
 };
 
 use bstr::{BStr, ByteSlice};
-use filter::{Filter, Highlighter, Style};
-use fmt::{fmt_field, rtrim, ColStat, FmtBuffer, Ty};
+use filter::Filter;
+use fmt::{ColStat, Fmt, Ty};
 use index::Indexer;
-use prompt::{Prompt, PromptCmd};
 use read::{Config, CsvReader, NestedString};
 use spinner::Spinner;
 use tui::{
     crossterm::event::{self, Event, KeyCode},
     none,
     unicode_width::UnicodeWidthChar,
-    Canvas, Color, Line, Terminal,
+    Canvas, Color, Terminal,
 };
+use ui::{FilterPrompt, Navigator};
 
 mod filter;
 mod fmt;
@@ -25,6 +25,7 @@ mod prompt;
 mod read;
 mod spinner;
 mod style;
+mod ui;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -60,108 +61,6 @@ impl FileWatcher {
                 false
             }
         })
-    }
-}
-
-pub struct FilterPrompt {
-    prompt: Prompt,
-    offset: usize,
-    err: Option<(Range<usize>, &'static str)>,
-}
-
-impl FilterPrompt {
-    pub fn new() -> Self {
-        Self {
-            prompt: Prompt::new(),
-            offset: 0,
-            err: None,
-        }
-    }
-
-    pub fn on_key(&mut self, code: KeyCode) -> Option<&str> {
-        self.err = None;
-        match code {
-            KeyCode::Char(c) => self.prompt.exec(PromptCmd::Write(c)),
-            KeyCode::Left => self.prompt.exec(PromptCmd::Left),
-            KeyCode::Right => self.prompt.exec(PromptCmd::Right),
-            KeyCode::Up => self.prompt.exec(PromptCmd::Prev),
-            KeyCode::Down => self.prompt.exec(PromptCmd::Next),
-            KeyCode::Backspace => self.prompt.exec(PromptCmd::Delete),
-            KeyCode::Enter => {
-                let (str, _) = self.prompt.state();
-                return Some(str);
-            }
-            _ => {}
-        }
-        None
-    }
-
-    pub fn on_compile(&mut self) {
-        self.prompt.exec(PromptCmd::New);
-    }
-
-    pub fn on_error(&mut self, err: (Range<usize>, &'static str)) {
-        self.err.replace(err);
-    }
-
-    pub fn draw(&mut self, c: &mut Canvas) {
-        let mut l = c.btm();
-        l.draw("$ ", none().fg(Color::DarkGrey));
-        let (str, cursor) = self.prompt.state();
-        let mut highlighter = Highlighter::new(str);
-        let mut pending_cursor = true;
-
-        for (i, c) in str.char_indices() {
-            if pending_cursor && cursor <= i {
-                l.cursor();
-                pending_cursor = false
-            }
-            l.draw(
-                c,
-                match highlighter.style(i) {
-                    Style::None | Style::Logi => none(),
-                    Style::Id => none().fg(Color::Blue),
-                    Style::Nb => none().fg(Color::Yellow),
-                    Style::Str => none().fg(Color::Green),
-                    Style::Regex => none().fg(Color::Magenta),
-                    Style::Action => none().fg(Color::Red),
-                },
-            );
-        }
-        if pending_cursor {
-            l.cursor();
-        }
-        if let Some((range, msg)) = &self.err {
-            c.btm().draw(
-                format_args!(
-                    "{s:<0$}{s:▾<1$} {msg}",
-                    range.start + 2,
-                    range.len(),
-                    s = ""
-                ),
-                none().fg(Color::Red),
-            );
-        }
-    }
-
-    pub fn draw_filter(l: &mut Line, filter: &str) {
-        let mut highlighter = Highlighter::new(filter);
-        for (i, c) in filter.char_indices() {
-            if l.width() == 0 {
-                return;
-            }
-            l.draw(
-                c,
-                match highlighter.style(i) {
-                    Style::None | Style::Logi => none(),
-                    Style::Id => none().fg(Color::Blue),
-                    Style::Nb => none().fg(Color::Yellow),
-                    Style::Str => none().fg(Color::Green),
-                    Style::Regex => none().fg(Color::Magenta),
-                    Style::Action => none().fg(Color::Red),
-                },
-            );
-        }
     }
 }
 
@@ -202,7 +101,7 @@ fn main() {
     }
 }
 
-struct Nav {
+pub struct Nav {
     // Offset position
     o_row: usize,
     o_col: usize,
@@ -212,6 +111,9 @@ struct Nav {
     // View dimension
     v_row: usize,
     v_col: usize,
+    // Max
+    m_row: usize,
+    m_col: usize,
 }
 
 impl Nav {
@@ -223,6 +125,8 @@ impl Nav {
             c_col: 0,
             v_row: 0,
             v_col: 0,
+            m_row: 0,
+            m_col: 0,
         }
     }
 
@@ -243,6 +147,7 @@ impl Nav {
     }
 
     pub fn row_offset(&mut self, total: usize, nb: usize) -> usize {
+        self.m_row = total;
         // Sync view dimension
         self.v_row = nb;
         // Ensure cursor pos fit in grid dimension
@@ -257,6 +162,7 @@ impl Nav {
     }
 
     pub fn col_iter(&mut self, total: usize) -> impl Iterator<Item = usize> + '_ {
+        self.m_col = total;
         // Ensure cursor pos fit in grid dimension
         self.c_col = self.c_col.min(total.saturating_sub(1));
         // Reset view dimension
@@ -299,6 +205,11 @@ impl Nav {
     pub fn cursor_col(&self) -> usize {
         self.c_col
     }
+
+    pub fn go_to(&mut self, (row, col): (Option<usize>, Option<usize>)) {
+        self.c_row = row.map(|nb| nb.saturating_sub(1)).unwrap_or(self.c_row);
+        self.c_col = col.map(|nb| nb.saturating_sub(1)).unwrap_or(self.c_col);
+    }
 }
 
 struct App {
@@ -308,12 +219,14 @@ struct App {
     nav: Nav,
     indexer: Indexer,
     spinner: Spinner,
-    fmt_buff: FmtBuffer,
+    fmt_buff: Fmt,
     dirty: bool,
     err: String,
     // Filter prompt
     focus_filter_prompt: bool,
     filter_prompt: FilterPrompt,
+    // Navigator
+    navigator: Option<Navigator>,
 }
 
 impl App {
@@ -327,12 +240,14 @@ impl App {
             grid: Grid::new(),
             nav: Nav::new(),
             spinner: Spinner::new(),
-            fmt_buff: FmtBuffer::new(),
+            fmt_buff: Fmt::new(),
             dirty: false,
             err: String::new(),
             // Filter prompt
             focus_filter_prompt: false,
             filter_prompt: FilterPrompt::new(),
+            // Navigator
+            navigator: None,
         })
     }
 
@@ -357,29 +272,52 @@ impl App {
     pub fn on_event(&mut self, event: Event) -> bool {
         if let Event::Key(event) = event {
             self.err.clear();
-            if self.focus_filter_prompt {
-                if let KeyCode::Esc = event.code {
-                    self.focus_filter_prompt = false;
-                } else if let Some(source) = self.filter_prompt.on_key(event.code) {
-                    match Filter::new(source, self.indexer.headers(), self.indexer.nb_col()) {
-                        Ok(filter) => {
-                            self.indexer = Indexer::index(&self.config, filter).unwrap();
-                            self.focus_filter_prompt = false;
-                            self.filter_prompt.on_compile();
+            if let Some(navigator) = &mut self.navigator {
+                match event.code {
+                    KeyCode::Esc => self.navigator = None,
+                    c => match navigator.on_key(c) {
+                        Some(pos) => {
+                            self.nav.go_to(pos);
+                            self.navigator = None;
                         }
-                        Err(err) => self.filter_prompt.on_error(err),
-                    }
+                        None => {}
+                    },
                 }
             } else {
-                match event.code {
-                    KeyCode::Char('q') => return true,
-                    KeyCode::Char('r') => self.refresh(),
-                    KeyCode::Left | KeyCode::Char('h') => self.nav.left(),
-                    KeyCode::Down | KeyCode::Char('j') => self.nav.down(),
-                    KeyCode::Up | KeyCode::Char('k') => self.nav.up(),
-                    KeyCode::Right | KeyCode::Char('l') => self.nav.right(),
-                    KeyCode::Char('/') => self.focus_filter_prompt = true,
-                    _ => {}
+                if self.focus_filter_prompt {
+                    match event.code {
+                        KeyCode::Esc => self.focus_filter_prompt = false,
+                        KeyCode::Char(':') => self.navigator = Some(Navigator::new(&self.nav)),
+                        code => {
+                            if let Some(source) = self.filter_prompt.on_key(code) {
+                                match Filter::new(
+                                    source,
+                                    self.indexer.headers(),
+                                    self.indexer.nb_col(),
+                                ) {
+                                    Ok(filter) => {
+                                        self.indexer =
+                                            Indexer::index(&self.config, filter).unwrap();
+                                        self.focus_filter_prompt = false;
+                                        self.filter_prompt.on_compile();
+                                    }
+                                    Err(err) => self.filter_prompt.on_error(err),
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    match event.code {
+                        KeyCode::Char('q') => return true,
+                        KeyCode::Char('r') => self.refresh(),
+                        KeyCode::Left | KeyCode::Char('h') => self.nav.left(),
+                        KeyCode::Down | KeyCode::Char('j') => self.nav.down(),
+                        KeyCode::Up | KeyCode::Char('k') => self.nav.up(),
+                        KeyCode::Right | KeyCode::Char('l') => self.nav.right(),
+                        KeyCode::Char('/') => self.focus_filter_prompt = true,
+                        KeyCode::Char(':') => self.navigator = Some(Navigator::new(&self.nav)),
+                        _ => {}
+                    }
                 }
             }
         }
@@ -396,6 +334,13 @@ impl App {
         } else if !self.err.is_empty() {
             c.top()
                 .draw(format_args!("{:^1$}", self.err, w), none().fg(Color::Red));
+        }
+
+        // Draw prompt
+        if let Some(navigator) = &self.navigator {
+            navigator.draw(c, &self.nav);
+        } else if self.focus_filter_prompt {
+            self.filter_prompt.draw(c);
         }
 
         // Sync state with indexer
@@ -415,7 +360,7 @@ impl App {
         let mut col_offset_iter = self.nav.col_iter(nb_col);
         let mut remaining_width = c.width() - id_len as usize - 1;
         let mut cols = Vec::new();
-        while remaining_width > cols.len() {
+        while remaining_width > cols.len() * 2 {
             if let Some(offset) = col_offset_iter.next() {
                 let (fields, mut stat) = rows
                     .iter()
@@ -434,7 +379,7 @@ impl App {
                 } else {
                     stat.header_idx(offset + 1);
                 }
-                let allowed = stat.budget().min(remaining_width - cols.len());
+                let allowed = stat.budget().min(remaining_width - cols.len() * 2);
                 remaining_width = remaining_width.saturating_sub(allowed);
                 cols.push((offset, fields, stat, allowed));
             } else {
@@ -446,10 +391,18 @@ impl App {
 
         // Draw status bar
         let mut l = c.btm();
-        if self.focus_filter_prompt || self.indexer.filter().is_some() {
-            l.draw(" FILTER ", none().bg(Color::Magenta).bold());
+        if self.navigator.is_some() {
+            l.draw(" NAV TO ", none().fg(Color::Black).bg(Color::Green).bold());
+        } else if self.focus_filter_prompt || self.indexer.filter().is_some() {
+            l.draw(
+                " FILTER ",
+                none().fg(Color::Black).bg(Color::Magenta).bold(),
+            );
         } else {
-            l.draw(" NORMAL ", none().bg(Color::DarkGrey).bold());
+            l.draw(
+                " NORMAL ",
+                none().fg(Color::Black).bg(Color::DarkGrey).bold(),
+            );
         }
         if let Some(char) = self.spinner.state(is_loading) {
             l.rdraw(
@@ -457,15 +410,9 @@ impl App {
                 none().fg(Color::Green),
             );
         }
-        l.rdraw(
-            fmt::quantity(&mut self.fmt_buff, self.nav.c_row + 1),
-            none(),
-        );
-        l.rdraw(':', none());
-        l.rdraw(
-            fmt::quantity(&mut self.fmt_buff, self.nav.cursor_col() + 1),
-            none(),
-        );
+        l.rdraw(fmt::quantity(self.nav.cursor_col() + 1), none());
+        l.rdraw(':', none().fg(Color::DarkGrey));
+        l.rdraw(fmt::quantity(self.nav.c_row + 1), none());
         l.rdraw(" ", none());
         l.rdraw(
             format_args!(" {:>3}%", ((self.nav.c_row + 1) * 100) / nb_row.max(1)),
@@ -478,10 +425,6 @@ impl App {
             l.draw(&self.config.path, none().fg(Color::Green));
         }
 
-        if self.focus_filter_prompt {
-            self.filter_prompt.draw(c);
-        }
-
         // Draw headers
         {
             let line = &mut c.top();
@@ -492,16 +435,17 @@ impl App {
 
             for (i, _, _, budget) in &cols {
                 let header = if let Some(name) = self.indexer.headers().get(*i) {
-                    rtrim(name, &mut self.fmt_buff, *budget)
+                    self.fmt_buff.rtrim(name, *budget)
                 } else {
-                    rtrim(*i + 1, &mut self.fmt_buff, *budget)
+                    self.fmt_buff.rtrim(*i + 1, *budget)
                 };
                 let style = if *i == self.nav.cursor_col() {
                     style::reverse(none().bold())
                 } else {
                     none().bold()
                 };
-                line.draw(format_args!("{header:<0$} ", budget), style);
+                line.draw(format_args!("{header:<0$}", budget), style);
+                line.draw("  ", none());
             }
         }
 
@@ -520,10 +464,7 @@ impl App {
             for (_, fields, stat, budget) in &cols {
                 let (ty, str) = fields[i];
                 line.draw(
-                    format_args!(
-                        "{} ",
-                        fmt_field(&mut self.fmt_buff, &ty, str, stat, *budget)
-                    ),
+                    format_args!("{}  ", self.fmt_buff.field(&ty, str, stat, *budget)),
                     style,
                 );
             }
