@@ -170,10 +170,7 @@ impl Highlighter {
 
     fn parse_expr(&mut self, lexer: &mut Lexer) {
         if lexer.take_kind(TokenKind::Not).is_some() {
-            lexer.next();
-            lexer.take_kind(TokenKind::OpenExpr);
             self.parse_expr(lexer);
-            lexer.take_kind(TokenKind::CloseExpr);
         } else if lexer.take_kind(TokenKind::OpenExpr).is_some() {
             self.parse_expr(lexer);
             lexer.take_kind(TokenKind::CloseExpr);
@@ -363,9 +360,7 @@ impl<'a> Compiler<'a> {
 
     fn parse_expr(&mut self) -> Result<u32> {
         if self.lexer.take_kind(TokenKind::Not).is_some() {
-            self.expect(TokenKind::OpenExpr, "Expect (")?;
             let idx = self.parse_expr()?;
-            self.expect(TokenKind::CloseExpr, "Expect )")?;
             Ok(Self::add(&mut self.filter.nodes, Node::Unary(true, idx)))
         } else if self.lexer.take_kind(TokenKind::OpenExpr).is_some() {
             let idx = self.parse_expr()?;
