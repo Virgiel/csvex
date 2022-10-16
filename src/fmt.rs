@@ -5,34 +5,6 @@ use tui::unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::BStrWidth;
 
-pub struct Quantity(u64);
-
-impl Display for Quantity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut nb = self.0;
-
-        const STEPS: [u64; 6] = [
-            1_000_000_000_000_000_000,
-            1_000_000_000_000_000,
-            1_000_000_000_000,
-            1_000_000_000,
-            1_000_000,
-            1_000,
-        ];
-
-        for step in STEPS {
-            if nb > step {
-                f.write_fmt(format_args!("{}_", nb / step))?;
-                nb = nb % step;
-            }
-        }
-        f.write_fmt(format_args!("{}", nb))
-    }
-}
-
-pub fn quantity(nb: usize) -> Quantity {
-    Quantity(nb as u64)
-}
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Ty {
@@ -123,6 +95,17 @@ impl Fmt {
         Self {
             buff: String::new(),
         }
+    }
+
+    pub fn quantity(&mut self, nb: usize) -> &str {
+        self.buff.clear();
+        write!(self.buff, "{nb}").unwrap();
+        let mut c = self.buff.len();
+        while c > 3 {
+            c -= 3;
+            self.buff.insert(c, '_');
+        }
+        &self.buff
     }
 
     pub fn rtrim(&mut self, it: impl Display, budget: usize) -> &str {

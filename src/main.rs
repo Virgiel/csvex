@@ -24,7 +24,6 @@ mod index;
 mod prompt;
 mod read;
 mod spinner;
-mod style;
 mod ui;
 
 #[global_allocator]
@@ -100,6 +99,8 @@ fn main() {
         }
     }
 }
+
+#[derive(Clone)]
 
 pub struct Nav {
     // Offset position
@@ -206,9 +207,9 @@ impl Nav {
         self.c_col
     }
 
-    pub fn go_to(&mut self, (row, col): (Option<usize>, Option<usize>)) {
-        self.c_row = row.map(|nb| nb.saturating_sub(1)).unwrap_or(self.c_row);
-        self.c_col = col.map(|nb| nb.saturating_sub(1)).unwrap_or(self.c_col);
+    pub fn go_to(&mut self, (row, col): (usize, usize)) {
+        self.c_row = row;
+        self.c_col = col;
     }
 }
 
@@ -219,7 +220,7 @@ struct App {
     nav: Nav,
     indexer: Indexer,
     spinner: Spinner,
-    fmt_buff: Fmt,
+    fmt: Fmt,
     dirty: bool,
     err: String,
     // Filter prompt
@@ -240,7 +241,7 @@ impl App {
             grid: Grid::new(),
             nav: Nav::new(),
             spinner: Spinner::new(),
-            fmt_buff: Fmt::new(),
+            fmt: Fmt::new(),
             dirty: false,
             err: String::new(),
             // Filter prompt
@@ -275,19 +276,19 @@ impl App {
             if let Some(navigator) = &mut self.navigator {
                 match event.code {
                     KeyCode::Esc => self.navigator = None,
-                    c => match navigator.on_key(c) {
-                        Some(pos) => {
-                            self.nav.go_to(pos);
-                            self.navigator = None;
-                        }
-                        None => {}
-                    },
+                    KeyCode::Enter => {
+                        self.nav = navigator.nav().clone();
+                        self.navigator = None;
+                    }
+                    c => navigator.on_key(c, &self.nav),
                 }
             } else {
                 if self.focus_filter_prompt {
                     match event.code {
                         KeyCode::Esc => self.focus_filter_prompt = false,
-                        KeyCode::Char(':') => self.navigator = Some(Navigator::new(&self.nav)),
+                        KeyCode::Char(':') => {
+                            self.navigator = Some(Navigator::new(self.nav.clone()))
+                        }
                         code => {
                             if let Some(source) = self.filter_prompt.on_key(code) {
                                 match Filter::new(
@@ -315,7 +316,9 @@ impl App {
                         KeyCode::Up | KeyCode::Char('k') => self.nav.up(),
                         KeyCode::Right | KeyCode::Char('l') => self.nav.right(),
                         KeyCode::Char('/') => self.focus_filter_prompt = true,
-                        KeyCode::Char(':') => self.navigator = Some(Navigator::new(&self.nav)),
+                        KeyCode::Char(':') => {
+                            self.navigator = Some(Navigator::new(self.nav.clone()))
+                        }
                         _ => {}
                     }
                 }
@@ -338,10 +341,16 @@ impl App {
 
         // Draw prompt
         if let Some(navigator) = &self.navigator {
-            navigator.draw(c, &self.nav);
+            navigator.draw_prompt(c);
         } else if self.focus_filter_prompt {
-            self.filter_prompt.draw(c);
+            self.filter_prompt.draw_prompt(c);
         }
+
+        let nav = if let Some(navigator) = &mut self.navigator {
+            navigator.nav()
+        } else {
+            &mut self.nav
+        };
 
         // Sync state with indexer
         let nb_col = self.indexer.nb_col();
@@ -349,7 +358,7 @@ impl App {
         let is_loading = self.indexer.is_loading();
         // Get rows content
         let nb_draw_row = c.height().saturating_sub(2);
-        let row_off = self.nav.row_offset(nb_row, nb_draw_row);
+        let row_off = nav.row_offset(nb_row, nb_draw_row);
         let offsets = self.indexer.get_offsets(row_off..row_off + nb_draw_row);
         self.grid.read_rows(&offsets, &mut self.rdr).unwrap();
         let rows = self.grid.rows();
@@ -357,7 +366,7 @@ impl App {
             .last()
             .map(|(i, _)| (*i as f32 + 1.).log10() as usize + 1)
             .unwrap_or(1);
-        let mut col_offset_iter = self.nav.col_iter(nb_col);
+        let mut col_offset_iter = nav.col_iter(nb_col);
         let mut remaining_width = c.width() - id_len as usize - 1;
         let mut cols = Vec::new();
         while remaining_width > cols.len() * 2 {
@@ -410,20 +419,28 @@ impl App {
                 none().fg(Color::Green),
             );
         }
-        l.rdraw(fmt::quantity(self.nav.cursor_col() + 1), none());
+        l.rdraw(self.fmt.quantity(self.nav.cursor_col() + 1), none());
         l.rdraw(':', none().fg(Color::DarkGrey));
-        l.rdraw(fmt::quantity(self.nav.c_row + 1), none());
+        l.rdraw(self.fmt.quantity(self.nav.c_row + 1), none());
         l.rdraw(" ", none());
         l.rdraw(
             format_args!(" {:>3}%", ((self.nav.c_row + 1) * 100) / nb_row.max(1)),
             none(),
         );
         l.draw(" ", none());
-        if let Some(filter) = self.indexer.filter() {
-            FilterPrompt::draw_filter(&mut l, filter);
+        if let Some(navigator) = &self.navigator {
+            navigator.draw_status(&mut l, &mut self.fmt)
+        } else if let Some(filter) = self.indexer.filter() {
+            FilterPrompt::draw_status(&mut l, filter);
         } else {
             l.draw(&self.config.path, none().fg(Color::Green));
         }
+
+        let nav = if let Some(navigator) = &mut self.navigator {
+            navigator.nav()
+        } else {
+            &mut self.nav
+        };
 
         // Draw headers
         {
@@ -435,12 +452,12 @@ impl App {
 
             for (i, _, _, budget) in &cols {
                 let header = if let Some(name) = self.indexer.headers().get(*i) {
-                    self.fmt_buff.rtrim(name, *budget)
+                    self.fmt.rtrim(name, *budget)
                 } else {
-                    self.fmt_buff.rtrim(*i + 1, *budget)
+                    self.fmt.rtrim(*i + 1, *budget)
                 };
-                let style = if *i == self.nav.cursor_col() {
-                    style::reverse(none().bold())
+                let style = if *i == nav.cursor_col() {
+                    none().fg(Color::DarkYellow).bold()
                 } else {
                     none().bold()
                 };
@@ -451,8 +468,8 @@ impl App {
 
         // Draw rows
         for (i, (e, _)) in rows.iter().enumerate() {
-            let style = if i == self.nav.cursor_row() {
-                style::reverse(none())
+            let style = if i == nav.cursor_row() {
+                none().fg(Color::DarkYellow)
             } else {
                 none()
             };
@@ -464,7 +481,7 @@ impl App {
             for (_, fields, stat, budget) in &cols {
                 let (ty, str) = fields[i];
                 line.draw(
-                    format_args!("{}  ", self.fmt_buff.field(&ty, str, stat, *budget)),
+                    format_args!("{}  ", self.fmt.field(&ty, str, stat, *budget)),
                     style,
                 );
             }

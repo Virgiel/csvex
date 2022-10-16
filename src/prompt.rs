@@ -89,10 +89,10 @@ impl Prompt {
                 Some(pos) => *pos = pos.saturating_sub(1),
                 None => {}
             },
-            PromptCmd::New => {
+            PromptCmd::New(keep) => {
                 let (str, _) = self.state();
                 self.history.push(str.into());
-                self.pos = None;
+                self.pos = keep.then_some(0);
                 self.buffer.clear();
             }
         }
@@ -115,6 +115,6 @@ pub enum PromptCmd {
     Right,
     Prev,
     Next,
-    New,
+    New(bool),
     Delete,
 }

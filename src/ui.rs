@@ -5,56 +5,60 @@ use tui::{crossterm::event::KeyCode, none, Canvas, Color, Line};
 
 use crate::{
     filter::{Highlighter, Style},
-    fmt,
+    fmt::Fmt,
     prompt::{Prompt, PromptCmd},
     Nav,
 };
 
 pub struct Navigator {
     buff: LineBuffer,
+    nav: Nav,
 }
 
 impl Navigator {
-    pub fn new(nav: &Nav) -> Self {
-        let mut buff = LineBuffer::new();
-        buff.set_buffer(format!("{}:{}", nav.c_row, nav.c_col));
-        Self { buff }
+    pub fn new(nav: Nav) -> Self {
+        let buff = LineBuffer::new();
+        Self { buff, nav }
     }
 
-    fn parse(&self) -> (Option<usize>, Option<usize>) {
-        let buff = self.buff.get_buffer();
-        let (line, col) = buff.split_once(':').unwrap_or((buff, ""));
-        (line.parse().ok(), col.parse().ok())
+    pub fn nav(&mut self) -> &mut Nav {
+        &mut self.nav
     }
 
-    pub fn on_key(&mut self, code: KeyCode) -> Option<(Option<usize>, Option<usize>)> {
+    pub fn on_key(&mut self, code: KeyCode, from: &Nav) {
         match code {
             KeyCode::Char(c) => self.buff.insert_char(c),
             KeyCode::Left => self.buff.move_left(),
             KeyCode::Right => self.buff.move_right(),
             KeyCode::Backspace => self.buff.delete_left_grapheme(),
-            KeyCode::Enter => {
-                return Some(self.parse());
-            }
             _ => {}
         }
 
-        None
+        let buff = self.buff.get_buffer();
+        let (row, col) = buff.split_once(':').unwrap_or((buff, ""));
+        let pos = (
+            row.parse::<usize>()
+                .map(|nb| nb.saturating_sub(1))
+                .unwrap_or(from.c_row),
+            col.parse::<usize>()
+                .map(|nb| nb.saturating_sub(1))
+                .unwrap_or(from.c_col),
+        );
+        self.nav.go_to(pos);
     }
 
-    pub fn draw(&self, c: &mut Canvas, nav: &Nav) {
-        let mut l = c.btm();
-        let (row, col) = self.parse();
-        let row = row.unwrap_or(nav.c_row);
-        let col = col.unwrap_or(nav.c_col);
+    pub fn draw_status(&self, l: &mut Line, fmt: &mut Fmt) {
         l.draw("Go to pos ", none());
-        l.draw(fmt::quantity(row), none());
+        l.draw(fmt.quantity(self.nav.c_row + 1), none());
         l.draw(':', none().fg(Color::DarkGrey));
-        l.draw(fmt::quantity(col), none());
+        l.draw(fmt.quantity(self.nav.c_col + 1), none());
         l.draw(" over ", none());
-        l.draw(fmt::quantity(nav.m_row), none());
+        l.draw(fmt.quantity(self.nav.m_row + 1), none());
         l.draw(':', none().fg(Color::DarkGrey));
-        l.draw(fmt::quantity(nav.m_col), none());
+        l.draw(fmt.quantity(self.nav.m_col + 1), none());
+    }
+
+    pub fn draw_prompt(&self, c: &mut Canvas) {
         let mut l = c.btm();
         l.draw("$ ", none().fg(Color::DarkGrey));
         let (str, cursor) = (self.buff.get_buffer(), self.buff.insertion_point());
@@ -107,14 +111,14 @@ impl FilterPrompt {
     }
 
     pub fn on_compile(&mut self) {
-        self.prompt.exec(PromptCmd::New);
+        self.prompt.exec(PromptCmd::New(true));
     }
 
     pub fn on_error(&mut self, err: (Range<usize>, &'static str)) {
         self.err.replace(err);
     }
 
-    pub fn draw(&mut self, c: &mut Canvas) {
+    pub fn draw_prompt(&mut self, c: &mut Canvas) {
         let mut l = c.btm();
         l.draw("$ ", none().fg(Color::DarkGrey));
         let (str, cursor) = self.prompt.state();
@@ -154,7 +158,7 @@ impl FilterPrompt {
         }
     }
 
-    pub fn draw_filter(l: &mut Line, filter: &str) {
+    pub fn draw_status(l: &mut Line, filter: &str) {
         let mut highlighter = Highlighter::new(filter);
         for (i, c) in filter.char_indices() {
             if l.width() == 0 {
