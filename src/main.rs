@@ -1,7 +1,7 @@
 use std::{
     io::{self},
     ops::Add,
-    time::{Duration, Instant, SystemTime},
+    time::Duration,
 };
 
 use bstr::{BStr, ByteSlice};
@@ -9,12 +9,13 @@ use filter::Filter;
 use fmt::{ColStat, Fmt, Ty};
 use index::Indexer;
 use read::{Config, CsvReader, NestedString};
+use size::{ColSize, SizeCmd};
+use source::FileWatcher;
 use spinner::Spinner;
 use tui::{
     crossterm::event::{self, Event, KeyCode},
-    none,
     unicode_width::UnicodeWidthChar,
-    Canvas, Color, Terminal,
+    Canvas, Terminal,
 };
 use ui::{FilterPrompt, Navigator};
 
@@ -23,45 +24,16 @@ mod fmt;
 mod index;
 mod prompt;
 mod read;
+mod size;
+mod source;
 mod spinner;
+mod style;
 mod ui;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub const BUF_LEN: usize = 8 * 1024;
-
-pub const WATCHER_POOL: Duration = Duration::from_secs(1);
-struct FileWatcher {
-    path: String,
-    m_time: SystemTime,
-    last: Instant,
-}
-
-impl FileWatcher {
-    pub fn new(path: String) -> io::Result<Self> {
-        Ok(Self {
-            last: Instant::now(),
-            m_time: std::fs::metadata(&path)?.modified()?,
-            path,
-        })
-    }
-
-    pub fn has_change(&mut self) -> io::Result<bool> {
-        Ok(if self.last.elapsed() < WATCHER_POOL {
-            false
-        } else {
-            self.last = Instant::now();
-            let m_time = std::fs::metadata(&self.path)?.modified()?;
-            if m_time != self.m_time {
-                self.m_time = m_time;
-                true
-            } else {
-                false
-            }
-        })
-    }
-}
 
 fn main() {
     let path = std::env::args()
@@ -147,6 +119,22 @@ impl Nav {
         self.c_col = self.c_col.saturating_add(1);
     }
 
+    pub fn full_up(&mut self) {
+        self.c_row = 0;
+    }
+
+    pub fn full_down(&mut self) {
+        self.c_row = self.m_row;
+    }
+
+    pub fn full_left(&mut self) {
+        self.c_col = 0;
+    }
+
+    pub fn full_right(&mut self) {
+        self.c_col = self.m_col;
+    }
+
     pub fn row_offset(&mut self, total: usize, nb: usize) -> usize {
         self.m_row = total;
         // Sync view dimension
@@ -223,11 +211,14 @@ struct App {
     fmt: Fmt,
     dirty: bool,
     err: String,
+    size: bool,
     // Filter prompt
     focus_filter_prompt: bool,
     filter_prompt: FilterPrompt,
     // Navigator
     navigator: Option<Navigator>,
+    // Cols
+    cols: ColSize,
 }
 
 impl App {
@@ -244,11 +235,14 @@ impl App {
             fmt: Fmt::new(),
             dirty: false,
             err: String::new(),
+            size: false,
             // Filter prompt
             focus_filter_prompt: false,
             filter_prompt: FilterPrompt::new(),
             // Navigator
             navigator: None,
+            // Cols
+            cols: ColSize::new(),
         })
     }
 
@@ -273,14 +267,25 @@ impl App {
     pub fn on_event(&mut self, event: Event) -> bool {
         if let Event::Key(event) = event {
             self.err.clear();
-            if let Some(navigator) = &mut self.navigator {
+            if self.size {
+                let col_idx = self.nav.c_col;
+                self.size = false;
                 match event.code {
-                    KeyCode::Esc => self.navigator = None,
-                    KeyCode::Enter => {
-                        self.nav = navigator.nav().clone();
-                        self.navigator = None;
+                    KeyCode::Esc => {}
+                    KeyCode::Char('r') => self.cols.reset(),
+                    KeyCode::Char('f') => self.cols.fit(),
+                    KeyCode::Left | KeyCode::Char('h') => self.cols.cmd(col_idx, SizeCmd::Less),
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.cols.cmd(col_idx, SizeCmd::Constrain)
                     }
-                    c => navigator.on_key(c, &self.nav),
+                    KeyCode::Up | KeyCode::Char('k') => self.cols.cmd(col_idx, SizeCmd::Full),
+                    KeyCode::Right | KeyCode::Char('l') => self.cols.cmd(col_idx, SizeCmd::More),
+                    _ => self.size = true,
+                }
+            } else if let Some(navigator) = &mut self.navigator {
+                if let Some(nav) = navigator.on_key(event.code) {
+                    self.nav = nav;
+                    self.navigator = None;
                 }
             } else {
                 if self.focus_filter_prompt {
@@ -316,7 +321,8 @@ impl App {
                         KeyCode::Up | KeyCode::Char('k') => self.nav.up(),
                         KeyCode::Right | KeyCode::Char('l') => self.nav.right(),
                         KeyCode::Char('/') => self.focus_filter_prompt = true,
-                        KeyCode::Char(':') => {
+                        KeyCode::Char('s') => self.size = true,
+                        KeyCode::Char('g') => {
                             self.navigator = Some(Navigator::new(self.nav.clone()))
                         }
                         _ => {}
@@ -332,11 +338,10 @@ impl App {
         // Draw error bar
         if self.dirty {
             let msg = "File content have changed, press 'r' to refresh";
-            c.top()
-                .draw(format_args!("{msg:^0$}", w), none().fg(Color::Red));
+            c.top().draw(format_args!("{msg:^0$}", w), style::error());
         } else if !self.err.is_empty() {
             c.top()
-                .draw(format_args!("{:^1$}", self.err, w), none().fg(Color::Red));
+                .draw(format_args!("{:^1$}", self.err, w), style::error());
         }
 
         // Draw prompt
@@ -368,6 +373,7 @@ impl App {
             .unwrap_or(1);
         let mut col_offset_iter = nav.col_iter(nb_col);
         let mut remaining_width = c.width() - id_len as usize - 1;
+        self.cols.set_nb_cols(nb_col);
         let mut cols = Vec::new();
         while remaining_width > cols.len() * 2 {
             if let Some(offset) = col_offset_iter.next() {
@@ -388,7 +394,11 @@ impl App {
                 } else {
                     stat.header_idx(offset + 1);
                 }
-                let allowed = stat.budget().min(remaining_width - cols.len() * 2);
+                self.cols.register_size(offset, stat.budget());
+                let allowed = self
+                    .cols
+                    .get_size(offset)
+                    .min(remaining_width - cols.len() * 2);
                 remaining_width = remaining_width.saturating_sub(allowed);
                 cols.push((offset, fields, stat, allowed));
             } else {
@@ -400,40 +410,36 @@ impl App {
 
         // Draw status bar
         let mut l = c.btm();
-        if self.navigator.is_some() {
-            l.draw(" NAV TO ", none().fg(Color::Black).bg(Color::Green).bold());
+        if self.size {
+            l.draw("  SIZE  ", style::state_action());
+        } else if self.navigator.is_some() {
+            l.draw("  GOTO  ", style::state_action());
         } else if self.focus_filter_prompt || self.indexer.filter().is_some() {
-            l.draw(
-                " FILTER ",
-                none().fg(Color::Black).bg(Color::Magenta).bold(),
-            );
+            l.draw(" FILTER ", style::state_filter());
         } else {
-            l.draw(
-                " NORMAL ",
-                none().fg(Color::Black).bg(Color::DarkGrey).bold(),
-            );
+            l.draw(" NORMAL ", style::state_default());
         }
         if let Some(char) = self.spinner.state(is_loading) {
             l.rdraw(
                 format_args!("{:>3}%{char}", self.indexer.progress()),
-                none().fg(Color::Green),
+                style::progress(),
             );
         }
-        l.rdraw(self.fmt.quantity(self.nav.cursor_col() + 1), none());
-        l.rdraw(':', none().fg(Color::DarkGrey));
-        l.rdraw(self.fmt.quantity(self.nav.c_row + 1), none());
-        l.rdraw(" ", none());
+        l.rdraw(self.fmt.amount(self.nav.cursor_col() + 1), style::primary());
+        l.rdraw(':', style::secondary());
+        l.rdraw(self.fmt.amount(self.nav.c_row + 1), style::primary());
+        l.rdraw(" ", style::primary());
         l.rdraw(
             format_args!(" {:>3}%", ((self.nav.c_row + 1) * 100) / nb_row.max(1)),
-            none(),
+            style::primary(),
         );
-        l.draw(" ", none());
+        l.draw(" ", style::primary());
         if let Some(navigator) = &self.navigator {
             navigator.draw_status(&mut l, &mut self.fmt)
         } else if let Some(filter) = self.indexer.filter() {
             FilterPrompt::draw_status(&mut l, filter);
         } else {
-            l.draw(&self.config.path, none().fg(Color::Green));
+            l.draw(&self.config.path, style::progress());
         }
 
         let nav = if let Some(navigator) = &mut self.navigator {
@@ -447,7 +453,7 @@ impl App {
             let line = &mut c.top();
             line.draw(
                 format_args!("{:>1$} ", '#', id_len),
-                none().fg(Color::DarkGrey).bold(),
+                style::secondary().bold(),
             );
 
             for (i, _, _, budget) in &cols {
@@ -457,27 +463,24 @@ impl App {
                     self.fmt.rtrim(*i + 1, *budget)
                 };
                 let style = if *i == nav.cursor_col() {
-                    none().fg(Color::DarkYellow).bold()
+                    style::selected().bold()
                 } else {
-                    none().bold()
+                    style::primary().bold()
                 };
                 line.draw(format_args!("{header:<0$}", budget), style);
-                line.draw("  ", none());
+                line.draw("  ", style::primary());
             }
         }
 
         // Draw rows
         for (i, (e, _)) in rows.iter().enumerate() {
             let style = if i == nav.cursor_row() {
-                none().fg(Color::DarkYellow)
+                style::selected()
             } else {
-                none()
+                style::primary()
             };
             let line = &mut c.top();
-            line.draw(
-                format_args!("{:>1$} ", *e + 1, id_len),
-                none().fg(Color::DarkGrey),
-            );
+            line.draw(format_args!("{:>1$} ", *e + 1, id_len), style::secondary());
             for (_, fields, stat, budget) in &cols {
                 let (ty, str) = fields[i];
                 line.draw(

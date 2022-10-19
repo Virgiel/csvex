@@ -5,7 +5,6 @@ use tui::unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::BStrWidth;
 
-
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Ty {
     Bool,
@@ -77,12 +76,11 @@ impl ColStat {
     }
 
     pub fn budget(&self) -> usize {
-        let desired = (self.max_lhs + self.max_rhs).max(self.header_len);
-        if self.only_str {
-            desired.min(25)
-        } else {
-            desired.min(40)
-        }
+        (self.max_lhs + self.max_rhs).max(self.header_len)
+    }
+
+    pub fn only_str(&self) -> bool {
+        self.only_str
     }
 }
 
@@ -97,7 +95,7 @@ impl Fmt {
         }
     }
 
-    pub fn quantity(&mut self, nb: usize) -> &str {
+    pub fn amount(&mut self, nb: usize) -> &str {
         self.buff.clear();
         write!(self.buff, "{nb}").unwrap();
         let mut c = self.buff.len();

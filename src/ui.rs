@@ -7,72 +7,114 @@ use crate::{
     filter::{Highlighter, Style},
     fmt::Fmt,
     prompt::{Prompt, PromptCmd},
-    Nav,
+    style, Nav,
 };
 
 pub struct Navigator {
     buff: LineBuffer,
     nav: Nav,
+    from: (usize, usize),
 }
 
 impl Navigator {
     pub fn new(nav: Nav) -> Self {
         let buff = LineBuffer::new();
-        Self { buff, nav }
+        Self {
+            buff,
+            from: (nav.c_row, nav.c_col),
+            nav,
+        }
     }
 
     pub fn nav(&mut self) -> &mut Nav {
         &mut self.nav
     }
 
-    pub fn on_key(&mut self, code: KeyCode, from: &Nav) {
+    pub fn on_key(&mut self, code: KeyCode) -> Option<Nav> {
+        if self.buff.is_empty() {
+            let ret = match code {
+                KeyCode::Left | KeyCode::Char('h') => {
+                    self.nav.full_left();
+                    true
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.nav.full_down();
+                    true
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.nav.full_up();
+                    true
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    self.nav.full_right();
+                    true
+                }
+                KeyCode::Enter | KeyCode::Esc => true,
+                _ => false,
+            };
+
+            if ret {
+                return Some(self.nav.clone());
+            }
+        }
+
         match code {
-            KeyCode::Char(c) => self.buff.insert_char(c),
+            KeyCode::Char(c) => {
+                self.buff.insert_char(c);
+                let buff = self.buff.get_buffer();
+                let (row, col) = buff.split_once(':').unwrap_or((buff, ""));
+                let pos = (
+                    row.parse::<usize>()
+                        .map(|nb| nb.saturating_sub(1))
+                        .unwrap_or(self.from.0),
+                    col.parse::<usize>()
+                        .map(|nb| nb.saturating_sub(1))
+                        .unwrap_or(self.from.1),
+                );
+                self.nav.go_to(pos);
+            }
             KeyCode::Left => self.buff.move_left(),
             KeyCode::Right => self.buff.move_right(),
             KeyCode::Backspace => self.buff.delete_left_grapheme(),
+            KeyCode::Enter => return Some(self.nav.clone()),
+            KeyCode::Esc => {
+                self.nav.go_to(self.from);
+                return Some(self.nav.clone());
+            }
             _ => {}
         }
 
-        let buff = self.buff.get_buffer();
-        let (row, col) = buff.split_once(':').unwrap_or((buff, ""));
-        let pos = (
-            row.parse::<usize>()
-                .map(|nb| nb.saturating_sub(1))
-                .unwrap_or(from.c_row),
-            col.parse::<usize>()
-                .map(|nb| nb.saturating_sub(1))
-                .unwrap_or(from.c_col),
-        );
-        self.nav.go_to(pos);
+        None
     }
 
     pub fn draw_status(&self, l: &mut Line, fmt: &mut Fmt) {
         l.draw("Go to pos ", none());
-        l.draw(fmt.quantity(self.nav.c_row + 1), none());
-        l.draw(':', none().fg(Color::DarkGrey));
-        l.draw(fmt.quantity(self.nav.c_col + 1), none());
+        l.draw(fmt.amount(self.nav.c_row + 1), none());
+        l.draw(':', style::secondary());
+        l.draw(fmt.amount(self.nav.c_col + 1), none());
         l.draw(" over ", none());
-        l.draw(fmt.quantity(self.nav.m_row + 1), none());
-        l.draw(':', none().fg(Color::DarkGrey));
-        l.draw(fmt.quantity(self.nav.m_col + 1), none());
+        l.draw(fmt.amount(self.nav.m_row + 1), none());
+        l.draw(':', style::secondary());
+        l.draw(fmt.amount(self.nav.m_col + 1), none());
     }
 
     pub fn draw_prompt(&self, c: &mut Canvas) {
-        let mut l = c.btm();
-        l.draw("$ ", none().fg(Color::DarkGrey));
-        let (str, cursor) = (self.buff.get_buffer(), self.buff.insertion_point());
-        let mut pending_cursor = true;
+        if !self.buff.is_empty() {
+            let mut l = c.btm();
+            l.draw("$ ", style::secondary());
+            let (str, cursor) = (self.buff.get_buffer(), self.buff.insertion_point());
+            let mut pending_cursor = true;
 
-        for (i, c) in str.char_indices() {
-            if pending_cursor && cursor <= i {
-                l.cursor();
-                pending_cursor = false
+            for (i, c) in str.char_indices() {
+                if pending_cursor && cursor <= i {
+                    l.cursor();
+                    pending_cursor = false
+                }
+                l.draw(c, none());
             }
-            l.draw(c, none());
-        }
-        if pending_cursor {
-            l.cursor();
+            if pending_cursor {
+                l.cursor();
+            }
         }
     }
 }
