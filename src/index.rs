@@ -16,7 +16,6 @@ use crate::{
 
 struct State {
     index: Mutex<Vec<(u32, u64)>>,
-    headers: NestedString,
     filter: Filter,
     file_len: u64,
     nb_col: AtomicUsize,
@@ -29,7 +28,7 @@ pub struct Indexer {
 }
 
 impl Indexer {
-    pub fn index(config: &Config, filter: Filter) -> io::Result<Self> {
+    pub fn index(config: &Config, filter: Filter) -> io::Result<(NestedString, Self)> {
         let mut rdr = config.reader()?;
         let mut headers = NestedString::new();
         if config.has_header {
@@ -39,9 +38,8 @@ impl Indexer {
             index: Mutex::new(Vec::with_capacity(1000)),
             filter,
             file_len: rdr.len()?,
-            nb_col: AtomicUsize::new(headers.len()),
+            nb_col: AtomicUsize::new(0),
             nb_read: AtomicU64::new(rdr.pos()?),
-            headers,
         });
 
         {
@@ -49,7 +47,7 @@ impl Indexer {
             thread::spawn(|| Self::bg_index(rdr, state));
         }
 
-        Ok(Self { state })
+        Ok((headers, Self { state }))
     }
 
     fn bg_index(mut rdr: CsvReader, state: Arc<State>) -> io::Result<()> {
@@ -86,6 +84,11 @@ impl Indexer {
             }
         }
 
+        if !buff_pos.is_empty() {
+            state.index.lock().append(&mut buff_pos);
+        }
+        state.nb_col.store(max_col, Relaxed);
+        state.nb_read.store(pos, Relaxed);
         Ok(())
     }
 
@@ -107,10 +110,6 @@ impl Indexer {
 
     pub fn filter(&self) -> Option<&str> {
         (!self.state.filter.nodes.is_empty()).then_some(self.state.filter.source.as_str())
-    }
-
-    pub fn headers(&self) -> &NestedString {
-        &self.state.headers
     }
 
     pub fn nb_col(&self) -> usize {

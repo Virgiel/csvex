@@ -3,7 +3,7 @@ use std::ops::Range;
 use regex::bytes::Regex;
 use rust_decimal::Decimal;
 
-use crate::read::NestedString;
+use crate::Cols;
 
 use super::lexer::{CmpOp, Lexer, LogiOp, MatchOp, Token, TokenKind};
 
@@ -191,18 +191,16 @@ impl Highlighter {
 struct Compiler<'a> {
     filter: Filter,
     lexer: Lexer<'a>,
-    headers: &'a NestedString,
-    nb_col: usize,
+    cols: &'a Cols,
 }
 
 impl<'a> Compiler<'a> {
-    fn compile(source: &'a str, headers: &'a NestedString, nb_col: usize) -> Result<Filter> {
+    fn compile(source: &'a str, cols: &'a Cols) -> Result<Filter> {
         let source = source.trim();
         let mut compiler = Self {
             filter: Filter::empty(),
             lexer: Lexer::load(source),
-            headers,
-            nb_col,
+            cols,
         };
 
         if compiler.lexer.peek().kind != TokenKind::Eof {
@@ -317,7 +315,7 @@ impl<'a> Compiler<'a> {
                 if let Ok(nb) = token.str.parse::<u32>() {
                     if nb == 0 {
                         return Err((token.span, "Column index are > 0"));
-                    } else if nb > self.nb_col as u32 {
+                    } else if nb > self.cols.visible_cols() as u32 {
                         return Err((token.span, "No column with this index"));
                     } else {
                         nb - 1
@@ -328,7 +326,7 @@ impl<'a> Compiler<'a> {
             }
             TokenKind::Str | TokenKind::Id => {
                 let name = token.str.trim_matches('"');
-                match self.headers.iter().position(|header| header == name) {
+                match self.cols.iter().position(|(_, header)| header == name) {
                     Some(i) => i as u32,
                     None => return Err((token.span, "No column with this name")),
                 }
@@ -402,7 +400,7 @@ impl Filter {
         }
     }
 
-    pub fn new(source: &str, headers: &NestedString, nb_col: usize) -> Result<Self> {
-        Compiler::compile(source, headers, nb_col)
+    pub fn new(source: &str, cols: &Cols) -> Result<Self> {
+        Compiler::compile(source, cols)
     }
 }

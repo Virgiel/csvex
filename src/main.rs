@@ -9,11 +9,10 @@ use filter::Filter;
 use fmt::{ColStat, Fmt, Ty};
 use index::Indexer;
 use read::{Config, CsvReader, NestedString};
-use size::{ColSize, SizeCmd};
 use source::FileWatcher;
 use spinner::Spinner;
 use tui::{
-    crossterm::event::{self, Event, KeyCode},
+    crossterm::event::{self, Event, KeyCode, KeyModifiers},
     unicode_width::UnicodeWidthChar,
     Canvas, Terminal,
 };
@@ -24,7 +23,6 @@ mod fmt;
 mod index;
 mod prompt;
 mod read;
-mod size;
 mod source;
 mod spinner;
 mod style;
@@ -136,11 +134,11 @@ impl Nav {
     }
 
     pub fn row_offset(&mut self, total: usize, nb: usize) -> usize {
-        self.m_row = total;
+        self.m_row = total.saturating_sub(1);
         // Sync view dimension
         self.v_row = nb;
         // Ensure cursor pos fit in grid dimension
-        self.c_row = self.c_row.min(total.saturating_sub(1));
+        self.c_row = self.c_row.min(self.m_row);
         // Ensure cursor is in view
         if self.c_row < self.o_row {
             self.o_row = self.c_row;
@@ -151,9 +149,9 @@ impl Nav {
     }
 
     pub fn col_iter(&mut self, total: usize) -> impl Iterator<Item = usize> + '_ {
-        self.m_col = total;
+        self.m_col = total.saturating_sub(1);
         // Ensure cursor pos fit in grid dimension
-        self.c_col = self.c_col.min(total.saturating_sub(1));
+        self.c_col = self.c_col.min(self.m_col);
         // Reset view dimension
         self.v_col = 0;
 
@@ -201,6 +199,134 @@ impl Nav {
     }
 }
 
+pub enum ColsCmd {
+    Hide,
+    Left,
+    Right,
+}
+
+pub enum SizeCmd {
+    Constrain,
+    Full,
+    Less,
+    More,
+}
+
+#[derive(Clone, Copy)]
+enum Constraint {
+    Constrained,
+    Full,
+    Defined(usize),
+}
+
+pub struct Cols {
+    headers: NestedString,
+    map: Vec<usize>,
+    size: Vec<(usize, Constraint)>,
+    nb_col: usize,
+}
+
+impl Cols {
+    pub fn new(headers: NestedString) -> Self {
+        Self {
+            headers,
+            map: vec![],
+            size: vec![],
+            nb_col: 0,
+        }
+    }
+
+    pub fn set_nb_cols(&mut self, nb_col: usize) {
+        if nb_col > self.size.len() {
+            self.size.resize(nb_col, (0, Constraint::Constrained));
+        }
+        for i in self.nb_col..nb_col {
+            self.map.push(i);
+        }
+        self.nb_col = nb_col;
+    }
+
+    pub fn visible_cols(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn get_col(&self, idx: usize) -> (usize, &BStr) {
+        let off = self.map[idx];
+        (off, self.headers.get(off).unwrap_or_default())
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &BStr)> {
+        self.map
+            .iter()
+            .map(|off| (*off, self.headers.get(*off).unwrap_or_default()))
+    }
+
+    pub fn cmd(&mut self, idx: usize, cmd: ColsCmd) {
+        if self.visible_cols() == 0 {
+            return;
+        }
+        match cmd {
+            ColsCmd::Hide => {
+                self.map.remove(idx);
+            }
+            ColsCmd::Left => self.map.swap(idx, idx.saturating_sub(1)),
+            ColsCmd::Right => {
+                if idx < self.map.len() - 1 {
+                    self.map.swap(idx, idx + 1);
+                }
+            }
+        }
+    }
+
+    pub fn set_headers(&mut self, headers: NestedString) {
+        self.headers = headers;
+    }
+
+    fn offset(&self, idx: usize) -> usize {
+        self.map[idx]
+    }
+
+    /* ----- Sizing ----- */
+
+    pub fn register_size(&mut self, idx: usize, len: usize) {
+        let off = self.offset(idx);
+        self.size[off].0 = self.size[off].0.max(len);
+    }
+
+    pub fn get_size(&mut self, idx: usize) -> usize {
+        let off = self.offset(idx);
+        let (size, constraint) = self.size[off];
+        match constraint {
+            Constraint::Constrained => size.min(25),
+            Constraint::Full => size,
+            Constraint::Defined(size) => size,
+        }
+    }
+
+    pub fn reset_size(&mut self) {
+        self.size.clear();
+    }
+
+    pub fn fit(&mut self) {
+        for (s, _) in &mut self.size {
+            *s = 0;
+        }
+    }
+
+    pub fn size_cmd(&mut self, idx: usize, cmd: SizeCmd) {
+        if self.visible_cols() == 0 {
+            return;
+        }
+        let off = self.offset(idx);
+        self.size[off].1 = match cmd {
+            SizeCmd::Constrain => Constraint::Constrained,
+            SizeCmd::Full => Constraint::Full,
+            SizeCmd::Less => Constraint::Defined(self.get_size(idx).saturating_sub(1)),
+            SizeCmd::More => Constraint::Defined(self.get_size(idx).saturating_add(1)),
+        };
+    }
+}
+
 struct App {
     config: Config,
     rdr: CsvReader,
@@ -212,19 +338,18 @@ struct App {
     dirty: bool,
     err: String,
     size: bool,
+    cols: Cols,
     // Filter prompt
     focus_filter_prompt: bool,
     filter_prompt: FilterPrompt,
     // Navigator
     navigator: Option<Navigator>,
-    // Cols
-    cols: ColSize,
 }
 
 impl App {
     pub fn open(path: String) -> io::Result<Self> {
         let (config, rdr) = Config::sniff(path)?;
-        let index = Indexer::index(&config, Filter::empty())?;
+        let (headers, index) = Indexer::index(&config, Filter::empty())?;
         Ok(Self {
             rdr,
             config,
@@ -236,13 +361,12 @@ impl App {
             dirty: false,
             err: String::new(),
             size: false,
+            cols: Cols::new(headers),
             // Filter prompt
             focus_filter_prompt: false,
             filter_prompt: FilterPrompt::new(),
             // Navigator
             navigator: None,
-            // Cols
-            cols: ColSize::new(),
         })
     }
 
@@ -252,10 +376,11 @@ impl App {
 
     pub fn refresh(&mut self) {
         let (config, rdr) = Config::sniff(self.config.path.clone()).unwrap();
-        let index = Indexer::index(&config, Filter::empty()).unwrap();
+        let (headers, index) = Indexer::index(&config, Filter::empty()).unwrap();
         self.config = config;
         self.rdr = rdr;
         self.indexer = index;
+        self.cols.set_headers(headers);
         self.grid = Grid::new();
         self.dirty = false;
     }
@@ -272,14 +397,18 @@ impl App {
                 self.size = false;
                 match event.code {
                     KeyCode::Esc => {}
-                    KeyCode::Char('r') => self.cols.reset(),
+                    KeyCode::Char('r') => self.cols.reset_size(),
                     KeyCode::Char('f') => self.cols.fit(),
-                    KeyCode::Left | KeyCode::Char('h') => self.cols.cmd(col_idx, SizeCmd::Less),
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        self.cols.cmd(col_idx, SizeCmd::Constrain)
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        self.cols.size_cmd(col_idx, SizeCmd::Less)
                     }
-                    KeyCode::Up | KeyCode::Char('k') => self.cols.cmd(col_idx, SizeCmd::Full),
-                    KeyCode::Right | KeyCode::Char('l') => self.cols.cmd(col_idx, SizeCmd::More),
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.cols.size_cmd(col_idx, SizeCmd::Constrain)
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => self.cols.size_cmd(col_idx, SizeCmd::Full),
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        self.cols.size_cmd(col_idx, SizeCmd::More)
+                    }
                     _ => self.size = true,
                 }
             } else if let Some(navigator) = &mut self.navigator {
@@ -296,14 +425,12 @@ impl App {
                         }
                         code => {
                             if let Some(source) = self.filter_prompt.on_key(code) {
-                                match Filter::new(
-                                    source,
-                                    self.indexer.headers(),
-                                    self.indexer.nb_col(),
-                                ) {
+                                match Filter::new(source, &self.cols) {
                                     Ok(filter) => {
-                                        self.indexer =
+                                        let (headers, index) =
                                             Indexer::index(&self.config, filter).unwrap();
+                                        self.indexer = index;
+                                        self.cols.set_headers(headers);
                                         self.focus_filter_prompt = false;
                                         self.filter_prompt.on_compile();
                                     }
@@ -316,10 +443,24 @@ impl App {
                     match event.code {
                         KeyCode::Char('q') => return true,
                         KeyCode::Char('r') => self.refresh(),
-                        KeyCode::Left | KeyCode::Char('h') => self.nav.left(),
+                        KeyCode::Char('-') => {
+                            self.cols.cmd(self.nav.c_col, ColsCmd::Hide);
+                        }
+
+                        KeyCode::Left | KeyCode::Char('h') => {
+                            if event.modifiers.contains(KeyModifiers::SHIFT) {
+                                self.cols.cmd(self.nav.c_col, ColsCmd::Left);
+                            }
+                            self.nav.left()
+                        }
                         KeyCode::Down | KeyCode::Char('j') => self.nav.down(),
                         KeyCode::Up | KeyCode::Char('k') => self.nav.up(),
-                        KeyCode::Right | KeyCode::Char('l') => self.nav.right(),
+                        KeyCode::Right | KeyCode::Char('l') => {
+                            if event.modifiers.contains(KeyModifiers::SHIFT) {
+                                self.cols.cmd(self.nav.c_col, ColsCmd::Right);
+                            }
+                            self.nav.right()
+                        }
                         KeyCode::Char('/') => self.focus_filter_prompt = true,
                         KeyCode::Char('s') => self.size = true,
                         KeyCode::Char('g') => {
@@ -361,6 +502,8 @@ impl App {
         let nb_col = self.indexer.nb_col();
         let nb_row = self.indexer.nb_row();
         let is_loading = self.indexer.is_loading();
+        self.cols.set_nb_cols(nb_col);
+        let visible_cols = self.cols.visible_cols();
         // Get rows content
         let nb_draw_row = c.height().saturating_sub(2);
         let row_off = nav.row_offset(nb_row, nb_draw_row);
@@ -371,15 +514,14 @@ impl App {
             .last()
             .map(|(i, _)| (*i as f32 + 1.).log10() as usize + 1)
             .unwrap_or(1);
-        let mut col_offset_iter = nav.col_iter(nb_col);
+        let mut col_idx_iter = nav.col_iter(visible_cols);
         let mut remaining_width = c.width() - id_len as usize - 1;
-        self.cols.set_nb_cols(nb_col);
         let mut cols = Vec::new();
         while remaining_width > cols.len() * 2 {
-            if let Some(offset) = col_offset_iter.next() {
+            if let Some(idx) = col_idx_iter.next() {
                 let (fields, mut stat) = rows
                     .iter()
-                    .map(|(_, n)| n.get(offset).unwrap_or_default())
+                    .map(|(_, n)| n.get(self.cols.get_col(idx).0).unwrap_or_default())
                     .fold(
                         (Vec::new(), ColStat::new()),
                         |(mut vec, mut stat), content| {
@@ -389,24 +531,25 @@ impl App {
                             (vec, stat)
                         },
                     );
-                if let Some(name) = self.indexer.headers().get(offset) {
+                let name = self.cols.get_col(idx).1;
+                if !name.is_empty() {
                     stat.header_name(name);
                 } else {
-                    stat.header_idx(offset + 1);
+                    stat.header_idx(idx + 1);
                 }
-                self.cols.register_size(offset, stat.budget());
+                self.cols.register_size(idx, stat.budget());
                 let allowed = self
                     .cols
-                    .get_size(offset)
+                    .get_size(idx)
                     .min(remaining_width - cols.len() * 2);
                 remaining_width = remaining_width.saturating_sub(allowed);
-                cols.push((offset, fields, stat, allowed));
+                cols.push((idx, fields, stat, allowed));
             } else {
                 break;
             }
         }
         cols.sort_unstable_by_key(|(i, _, _, _)| *i); // Find a way to store col in order
-        drop(col_offset_iter);
+        drop(col_idx_iter);
 
         // Draw status bar
         let mut l = c.btm();
@@ -457,7 +600,8 @@ impl App {
             );
 
             for (i, _, _, budget) in &cols {
-                let header = if let Some(name) = self.indexer.headers().get(*i) {
+                let (_, name) = self.cols.get_col(*i);
+                let header = if !name.is_empty() {
                     self.fmt.rtrim(name, *budget)
                 } else {
                     self.fmt.rtrim(*i + 1, *budget)
