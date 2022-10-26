@@ -71,11 +71,9 @@ fn main() {
 }
 
 #[derive(Clone)]
-
 pub struct Nav {
     // Offset position
     o_row: usize,
-    o_col: usize,
     // Cursor positions
     c_row: usize,
     c_col: usize,
@@ -91,7 +89,6 @@ impl Nav {
     pub fn new() -> Self {
         Self {
             o_row: 0,
-            o_col: 0,
             c_row: 0,
             c_col: 0,
             v_row: 0,
@@ -154,34 +151,23 @@ impl Nav {
         self.c_col = self.c_col.min(self.m_col);
         // Reset view dimension
         self.v_col = 0;
+        let amount_right = self.m_col - self.c_col;
 
-        let amount_right = total - self.c_col;
-        let goal_left = self.c_col.saturating_sub(self.o_col);
-
-        // Coll offset iterator
+        // Cols offset iterator
         std::iter::from_fn(move || -> Option<usize> {
-            if self.v_col < total {
-                let step = self.v_col;
-                self.v_col += 1;
-                let result = if step <= goal_left {
-                    // Reach goal
-                    self.c_col - step
-                } else if step < goal_left + amount_right {
-                    // Then fill right
-                    self.c_col + (step - goal_left)
-                } else {
-                    // Then fill left
-                    self.c_col - (step - goal_left - amount_right)
-                };
-                if result < self.o_col {
-                    self.o_col = result;
-                } else if result > self.o_col + step {
-                    self.o_col = result - step;
-                }
-                Some(result)
-            } else {
-                None
+            let step = self.v_col;
+            if step >= total {
+                return None;
             }
+            let result = if step <= amount_right {
+                // Fill right
+                self.c_col + (step)
+            } else {
+                // Then fill left
+                self.c_col - (step - amount_right)
+            };
+            self.v_col += 1;
+            Some(result)
         })
     }
 
