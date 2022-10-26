@@ -20,7 +20,7 @@ rust_decimal = { version = "1.26.1", default-features = false }
 # Regular expression lib
 regex = "1.6.0"
 # Line editor tool
-reedline = "0.12.0"
+reedline = "0.13.0"
 
 # Optimal size and perf
 [profile.release]
