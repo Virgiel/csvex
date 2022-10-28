@@ -78,10 +78,6 @@ impl ColStat {
     pub fn budget(&self) -> usize {
         (self.max_lhs + self.max_rhs).max(self.header_len)
     }
-
-    pub fn only_str(&self) -> bool {
-        self.only_str
-    }
 }
 
 pub struct Fmt {

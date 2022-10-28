@@ -74,6 +74,7 @@ fn main() {
 pub struct Nav {
     // Offset position
     o_row: usize,
+    o_col: usize,
     // Cursor positions
     c_row: usize,
     c_col: usize,
@@ -89,6 +90,7 @@ impl Nav {
     pub fn new() -> Self {
         Self {
             o_row: 0,
+            o_col: 0,
             c_row: 0,
             c_col: 0,
             v_row: 0,
@@ -139,36 +141,49 @@ impl Nav {
         // Ensure cursor is in view
         if self.c_row < self.o_row {
             self.o_row = self.c_row;
-        } else if self.c_row >= self.o_row + nb {
-            self.o_row = self.c_row - nb + 1;
+        } else if self.c_row >= self.o_row + self.v_row {
+            self.o_row = self.c_row - self.v_row + 1;
         }
         self.o_row
     }
 
-    pub fn col_iter(&mut self, total: usize) -> impl Iterator<Item = usize> + '_ {
+    pub fn col_iter(&mut self, total: usize, mut fit: impl FnMut(usize) -> bool) {
         self.m_col = total.saturating_sub(1);
         // Ensure cursor pos fit in grid dimension
         self.c_col = self.c_col.min(self.m_col);
-        // Reset view dimension
-        self.v_col = 0;
-        let amount_right = self.m_col - self.c_col;
+        // Ensure cursor is in view
+        if self.c_col < self.o_col {
+            self.o_col = self.c_col;
+        }
 
-        // Cols offset iterator
-        std::iter::from_fn(move || -> Option<usize> {
-            let step = self.v_col;
-            if step >= total {
-                return None;
+        self.v_col = 0;
+        let goal_l = self.o_col;
+        self.o_col = self.c_col;
+        if total > 0 {
+            loop {
+                let off = if goal_l + self.v_col <= self.c_col {
+                    // Fill left until goal
+                    self.c_col - self.v_col
+                } else if goal_l + self.v_col <= self.m_col {
+                    // Then fill right
+                    goal_l + self.v_col
+                } else if self.v_col <= self.m_col {
+                    // Then fill left
+                    self.m_col - self.v_col
+                } else {
+                    // No more columns
+                    break;
+                };
+                self.v_col += 1;
+                let is_fitting = fit(off);
+                if is_fitting || off >= goal_l {
+                    self.o_col = self.o_col.min(off);
+                }
+                if !is_fitting {
+                    break;
+                }
             }
-            let result = if step <= amount_right {
-                // Fill right
-                self.c_col + (step)
-            } else {
-                // Then fill left
-                self.c_col - (step - amount_right)
-            };
-            self.v_col += 1;
-            Some(result)
-        })
+        }
     }
 
     pub fn cursor_row(&self) -> usize {
@@ -274,12 +289,13 @@ impl Cols {
 
     /* ----- Sizing ----- */
 
-    pub fn register_size(&mut self, idx: usize, len: usize) {
+    pub fn size(&mut self, idx: usize, len: usize) -> usize {
         let off = self.offset(idx);
         self.size[off].0 = self.size[off].0.max(len);
+        self.get_size(idx)
     }
 
-    pub fn get_size(&mut self, idx: usize) -> usize {
+    fn get_size(&mut self, idx: usize) -> usize {
         let off = self.offset(idx);
         let (size, constraint) = self.size[off];
         match constraint {
@@ -500,11 +516,11 @@ impl App {
             .last()
             .map(|(i, _)| (*i as f32 + 1.).log10() as usize + 1)
             .unwrap_or(1);
-        let mut col_idx_iter = nav.col_iter(visible_cols);
-        let mut remaining_width = c.width() - id_len as usize - 1;
+        let mut remain_table_w = c.width() - id_len as usize - 1;
         let mut cols = Vec::new();
-        while remaining_width > cols.len() * 2 {
-            if let Some(idx) = col_idx_iter.next() {
+        nav.col_iter(visible_cols, |idx| {
+            let remain_col_w = remain_table_w.saturating_sub(cols.len() * 2);
+            if remain_col_w > 0 {
                 let (fields, mut stat) = rows
                     .iter()
                     .map(|(_, n)| n.get(self.cols.get_col(idx).0).unwrap_or_default())
@@ -523,19 +539,16 @@ impl App {
                 } else {
                     stat.header_idx(idx + 1);
                 }
-                self.cols.register_size(idx, stat.budget());
-                let allowed = self
-                    .cols
-                    .get_size(idx)
-                    .min(remaining_width - cols.len() * 2);
-                remaining_width = remaining_width.saturating_sub(allowed);
+                let col_size = self.cols.size(idx, stat.budget());
+                let allowed = col_size.min(remain_col_w);
+                remain_table_w = remain_table_w.saturating_sub(allowed);
                 cols.push((idx, fields, stat, allowed));
+                remain_col_w >= col_size
             } else {
-                break;
+                false
             }
-        }
+        });
         cols.sort_unstable_by_key(|(i, _, _, _)| *i); // Find a way to store col in order
-        drop(col_idx_iter);
 
         // Draw status bar
         let mut l = c.btm();
