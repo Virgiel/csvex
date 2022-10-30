@@ -3,7 +3,7 @@ use rust_decimal::Decimal;
 use std::fmt::{Display, Write as is_empty};
 use tui::unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::BStrWidth;
+use crate::{nb_print_len, BStrWidth};
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Ty {
@@ -58,10 +58,6 @@ impl ColStat {
         self.header_len = s.width();
     }
 
-    pub fn header_idx(&mut self, i: usize) {
-        self.header_len = (i as f64).log10() as usize + 1;
-    }
-
     pub fn add(&mut self, ty: &Ty, s: &BStr) {
         self.only_str &= ty.is_str();
         match ty {
@@ -76,7 +72,7 @@ impl ColStat {
     }
 
     pub fn budget(&self) -> usize {
-        (self.max_lhs + self.max_rhs).max(self.header_len)
+        (self.max_lhs + self.max_rhs).max(self.header_len.min(5))
     }
 }
 

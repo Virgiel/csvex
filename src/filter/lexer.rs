@@ -10,19 +10,20 @@ pub enum TokenKind {
     Cmp(CmpOp),
     Logi(LogiOp),
     Match(MatchOp),
-    Matches,    // matches, ~,
-    Not,        // not, !
-    OpenExpr,   // (
-    CloseExpr,  // )
-    OpenRange,  // [
-    CloseRange, // ]
-    SepRange,   // :
-    OpenList,   // {
-    CloseList,  // }
-    SepList,    // ,
-    Nb,         // Decimal Number
-    Str,        // surrounded by "
-    Id,         // surrounded by whitespace
+    Matches,     // matches, ~,
+    Not,         // not, !
+    OpenExpr,    // (
+    CloseExpr,   // )
+    OpenRange,   // [
+    CloseRange,  // ]
+    SepRangeLen, // :
+    SepRangeEnd, // -
+    OpenList,    // {
+    CloseList,   // }
+    SepList,     // ,
+    Nb,          // Decimal Number
+    Str,         // surrounded by "
+    Id,          // surrounded by whitespace
     Eof,
 }
 
@@ -138,7 +139,8 @@ impl<'a> Lexer<'a> {
                 b'[' => TokenKind::OpenRange,
                 b']' => TokenKind::CloseRange,
                 b',' => TokenKind::SepList,
-                b':' => TokenKind::SepRange,
+                b':' => TokenKind::SepRangeLen,
+                b'-' => TokenKind::SepRangeEnd,
                 _ => TokenKind::Eof,
             };
 

@@ -33,6 +33,10 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub const BUF_LEN: usize = 8 * 1024;
 
+pub fn nb_print_len(nb: usize) -> usize {
+    (nb as f64).log10() as usize + 1
+}
+
 fn main() {
     let path = std::env::args()
         .nth(1)
@@ -225,6 +229,7 @@ pub struct Cols {
     map: Vec<usize>,
     size: Vec<(usize, Constraint)>,
     nb_col: usize,
+    max_col: usize,
 }
 
 impl Cols {
@@ -234,6 +239,7 @@ impl Cols {
             map: vec![],
             size: vec![],
             nb_col: 0,
+            max_col: 0,
         }
     }
 
@@ -241,10 +247,11 @@ impl Cols {
         if nb_col > self.size.len() {
             self.size.resize(nb_col, (0, Constraint::Constrained));
         }
-        for i in self.nb_col..nb_col {
+        for i in self.max_col..nb_col {
             self.map.push(i);
         }
         self.nb_col = nb_col;
+        self.max_col = self.max_col.max(self.nb_col);
     }
 
     pub fn visible_cols(&self) -> usize {
@@ -253,13 +260,13 @@ impl Cols {
 
     pub fn get_col(&self, idx: usize) -> (usize, &BStr) {
         let off = self.map[idx];
-        (off, self.headers.get(off).unwrap_or_default())
+        (off, self.headers.get(off).unwrap_or(BStr::new("?")))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (usize, &BStr)> {
         self.map
             .iter()
-            .map(|off| (*off, self.headers.get(*off).unwrap_or_default()))
+            .map(|off| (*off, self.headers.get(*off).unwrap_or(BStr::new("?"))))
     }
 
     pub fn cmd(&mut self, idx: usize, cmd: ColsCmd) {
@@ -329,6 +336,13 @@ impl Cols {
     }
 }
 
+enum AppState {
+    Normal,
+    Filter { show_off: bool },
+    Size,
+    Nav(Navigator),
+}
+
 struct App {
     config: Config,
     rdr: CsvReader,
@@ -339,13 +353,9 @@ struct App {
     fmt: Fmt,
     dirty: bool,
     err: String,
-    size: bool,
     cols: Cols,
-    // Filter prompt
-    focus_filter_prompt: bool,
+    state: AppState,
     filter_prompt: FilterPrompt,
-    // Navigator
-    navigator: Option<Navigator>,
 }
 
 impl App {
@@ -362,13 +372,9 @@ impl App {
             fmt: Fmt::new(),
             dirty: false,
             err: String::new(),
-            size: false,
             cols: Cols::new(headers),
-            // Filter prompt
-            focus_filter_prompt: false,
             filter_prompt: FilterPrompt::new(),
-            // Navigator
-            navigator: None,
+            state: AppState::Normal,
         })
     }
 
@@ -394,81 +400,83 @@ impl App {
     pub fn on_event(&mut self, event: Event) -> bool {
         if let Event::Key(event) = event {
             self.err.clear();
-            if self.size {
-                let col_idx = self.nav.c_col;
-                self.size = false;
-                match event.code {
-                    KeyCode::Esc => {}
-                    KeyCode::Char('r') => self.cols.reset_size(),
-                    KeyCode::Char('f') => self.cols.fit(),
-                    KeyCode::Left | KeyCode::Char('h') => {
-                        self.cols.size_cmd(col_idx, SizeCmd::Less)
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        self.cols.size_cmd(col_idx, SizeCmd::Constrain)
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => self.cols.size_cmd(col_idx, SizeCmd::Full),
-                    KeyCode::Right | KeyCode::Char('l') => {
-                        self.cols.size_cmd(col_idx, SizeCmd::More)
-                    }
-                    _ => self.size = true,
-                }
-            } else if let Some(navigator) = &mut self.navigator {
-                if let Some(nav) = navigator.on_key(event.code) {
-                    self.nav = nav;
-                    self.navigator = None;
-                }
-            } else {
-                if self.focus_filter_prompt {
-                    match event.code {
-                        KeyCode::Esc => self.focus_filter_prompt = false,
-                        KeyCode::Char(':') => {
-                            self.navigator = Some(Navigator::new(self.nav.clone()))
-                        }
-                        code => {
-                            if let Some(source) = self.filter_prompt.on_key(code) {
-                                match Filter::new(source, &self.cols) {
-                                    Ok(filter) => {
-                                        let (headers, index) =
-                                            Indexer::index(&self.config, filter).unwrap();
-                                        self.indexer = index;
-                                        self.cols.set_headers(headers);
-                                        self.focus_filter_prompt = false;
-                                        self.filter_prompt.on_compile();
-                                    }
-                                    Err(err) => self.filter_prompt.on_error(err),
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    match event.code {
-                        KeyCode::Char('q') => return true,
-                        KeyCode::Char('r') => self.refresh(),
-                        KeyCode::Char('-') => {
-                            self.cols.cmd(self.nav.c_col, ColsCmd::Hide);
-                        }
 
+            match &mut self.state {
+                AppState::Normal => match event.code {
+                    KeyCode::Char('q') => return true,
+                    KeyCode::Char('r') => self.refresh(),
+                    KeyCode::Char('-') => {
+                        self.cols.cmd(self.nav.c_col, ColsCmd::Hide);
+                    }
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        if event.modifiers.contains(KeyModifiers::SHIFT) {
+                            self.cols.cmd(self.nav.c_col, ColsCmd::Left);
+                        }
+                        self.nav.left()
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => self.nav.down(),
+                    KeyCode::Up | KeyCode::Char('k') => self.nav.up(),
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        if event.modifiers.contains(KeyModifiers::SHIFT) {
+                            self.cols.cmd(self.nav.c_col, ColsCmd::Right);
+                        }
+                        self.nav.right()
+                    }
+                    KeyCode::Char('/') => self.state = AppState::Filter { show_off: true },
+                    KeyCode::Char('s') => self.state = AppState::Size,
+                    KeyCode::Char('g') => {
+                        self.state = AppState::Nav(Navigator::new(self.nav.clone()))
+                    }
+                    _ => {}
+                },
+                AppState::Filter { show_off } => match event.code {
+                    KeyCode::Esc => self.state = AppState::Normal,
+                    KeyCode::Tab => *show_off = !*show_off,
+                    code => {
+                        if let Some(source) = self.filter_prompt.on_key(code) {
+                            match Filter::new(source, self.cols.nb_col) {
+                                Ok(filter) => {
+                                    let (headers, index) =
+                                        Indexer::index(&self.config, filter).unwrap();
+                                    self.indexer = index;
+                                    self.cols.set_headers(headers);
+                                    self.state = AppState::Normal;
+                                    self.filter_prompt.on_compile();
+                                }
+                                Err(err) => self.filter_prompt.on_error(err),
+                            }
+                        }
+                    }
+                },
+                AppState::Size => {
+                    let col_idx = self.nav.c_col;
+                    let mut exit_size = true;
+                    match event.code {
+                        KeyCode::Esc => {}
+                        KeyCode::Char('r') => self.cols.reset_size(),
+                        KeyCode::Char('f') => self.cols.fit(),
                         KeyCode::Left | KeyCode::Char('h') => {
-                            if event.modifiers.contains(KeyModifiers::SHIFT) {
-                                self.cols.cmd(self.nav.c_col, ColsCmd::Left);
-                            }
-                            self.nav.left()
+                            self.cols.size_cmd(col_idx, SizeCmd::Less)
                         }
-                        KeyCode::Down | KeyCode::Char('j') => self.nav.down(),
-                        KeyCode::Up | KeyCode::Char('k') => self.nav.up(),
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            self.cols.size_cmd(col_idx, SizeCmd::Constrain)
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            self.cols.size_cmd(col_idx, SizeCmd::Full)
+                        }
                         KeyCode::Right | KeyCode::Char('l') => {
-                            if event.modifiers.contains(KeyModifiers::SHIFT) {
-                                self.cols.cmd(self.nav.c_col, ColsCmd::Right);
-                            }
-                            self.nav.right()
+                            self.cols.size_cmd(col_idx, SizeCmd::More)
                         }
-                        KeyCode::Char('/') => self.focus_filter_prompt = true,
-                        KeyCode::Char('s') => self.size = true,
-                        KeyCode::Char('g') => {
-                            self.navigator = Some(Navigator::new(self.nav.clone()))
-                        }
-                        _ => {}
+                        _ => exit_size = false,
+                    };
+                    if exit_size {
+                        self.state = AppState::Normal
+                    }
+                }
+                AppState::Nav(navigator) => {
+                    if let Some(nav) = navigator.on_key(event.code) {
+                        self.nav = nav;
+                        self.state = AppState::Normal;
                     }
                 }
             }
@@ -488,16 +496,17 @@ impl App {
         }
 
         // Draw prompt
-        if let Some(navigator) = &self.navigator {
-            navigator.draw_prompt(c);
-        } else if self.focus_filter_prompt {
-            self.filter_prompt.draw_prompt(c);
+        match &self.state {
+            AppState::Filter { .. } => self.filter_prompt.draw_prompt(c),
+            AppState::Nav(navigator) => {
+                navigator.draw_prompt(c);
+            }
+            AppState::Normal | AppState::Size => {}
         }
 
-        let nav = if let Some(navigator) = &mut self.navigator {
-            navigator.nav()
-        } else {
-            &mut self.nav
+        let nav = match &mut self.state {
+            AppState::Nav(navigator) => navigator.nav(),
+            _ => &mut self.nav,
         };
 
         // Sync state with indexer
@@ -519,7 +528,7 @@ impl App {
         let mut remain_table_w = c.width() - id_len as usize - 1;
         let mut cols = Vec::new();
         nav.col_iter(visible_cols, |idx| {
-            let remain_col_w = remain_table_w.saturating_sub(cols.len() * 2);
+            let remain_col_w = remain_table_w.saturating_sub(cols.len());
             if remain_col_w > 0 {
                 let (fields, mut stat) = rows
                     .iter()
@@ -534,11 +543,7 @@ impl App {
                         },
                     );
                 let name = self.cols.get_col(idx).1;
-                if !name.is_empty() {
-                    stat.header_name(name);
-                } else {
-                    stat.header_idx(idx + 1);
-                }
+                stat.header_name(name);
                 let col_size = self.cols.size(idx, stat.budget());
                 let allowed = col_size.min(remain_col_w);
                 remain_table_w = remain_table_w.saturating_sub(allowed);
@@ -552,46 +557,50 @@ impl App {
 
         // Draw status bar
         let mut l = c.btm();
-        if self.size {
-            l.draw("  SIZE  ", style::state_action());
-        } else if self.navigator.is_some() {
-            l.draw("  GOTO  ", style::state_action());
-        } else if self.focus_filter_prompt || self.indexer.filter().is_some() {
-            l.draw(" FILTER ", style::state_filter());
-        } else {
-            l.draw(" NORMAL ", style::state_default());
-        }
+        match &self.state {
+            AppState::Filter { .. } => l.draw(" FILTER ", style::state_filter()),
+            AppState::Normal if self.indexer.filter().is_some() => {
+                l.draw(" FILTER ", style::state_filter())
+            }
+            AppState::Normal => l.draw(" NORMAL ", style::state_default()),
+            AppState::Size => l.draw("  SIZE  ", style::state_action()),
+            AppState::Nav(_) => l.draw("  GOTO  ", style::state_action()),
+        };
+        l.draw(" ", style::primary());
         if let Some(char) = self.spinner.state(is_loading) {
             l.rdraw(
-                format_args!("{:>3}%{char}", self.indexer.progress()),
+                format_args!(" {:>2}%{char}", self.indexer.progress()),
                 style::progress(),
             );
-        }
-        l.rdraw(self.fmt.amount(self.nav.cursor_col() + 1), style::primary());
-        l.rdraw(':', style::secondary());
-        l.rdraw(self.fmt.amount(self.nav.c_row + 1), style::primary());
-        l.rdraw(" ", style::primary());
-        l.rdraw(
-            format_args!(" {:>3}%", ((self.nav.c_row + 1) * 100) / nb_row.max(1)),
-            style::primary(),
-        );
-        l.draw(" ", style::primary());
-        if let Some(navigator) = &self.navigator {
-            navigator.draw_status(&mut l, &mut self.fmt)
-        } else if let Some(filter) = self.indexer.filter() {
-            FilterPrompt::draw_status(&mut l, filter);
         } else {
-            l.draw(&self.config.path, style::progress());
+            let progress = ((self.nav.c_row + 1) * 100) / nb_row.max(1);
+            l.rdraw(format_args!(" {progress:>3}%"), style::primary());
         }
 
-        let nav = if let Some(navigator) = &mut self.navigator {
-            navigator.nav()
-        } else {
-            &mut self.nav
-        };
+        if self.cols.nb_col > 0 {
+            let (_, name) = self.cols.get_col(self.nav.cursor_col());
+            l.rdraw(name, style::primary());
+            l.rdraw(" ", style::primary());
+        }
+
+        match &self.state {
+            AppState::Nav(navigator) => navigator.draw_status(&mut l, &mut self.fmt),
+            _ => {
+                if let Some(filter) = self.indexer.filter() {
+                    FilterPrompt::draw_status(&mut l, filter)
+                } else {
+                    l.draw(&self.config.path, style::progress());
+                }
+            }
+        }
 
         // Draw headers
-        {
+        let show_off = matches!(self.state, AppState::Filter { show_off: true });
+        let nav = match &mut self.state {
+            AppState::Nav(navigator) => navigator.nav(),
+            _ => &mut self.nav,
+        };
+        if self.config.has_header || show_off {
             let line = &mut c.top();
             line.draw(
                 format_args!("{:>1$} ", '#', id_len),
@@ -599,19 +608,27 @@ impl App {
             );
 
             for (i, _, _, budget) in &cols {
-                let (_, name) = self.cols.get_col(*i);
-                let header = if !name.is_empty() {
-                    self.fmt.rtrim(name, *budget)
+                let (off, name) = self.cols.get_col(*i);
+
+                if show_off {
+                    let style = if *i == nav.cursor_col() {
+                        style::selected().bold()
+                    } else {
+                        style::secondary().bold()
+                    };
+                    line.draw(format_args!("{off:<0$}", budget), style);
                 } else {
-                    self.fmt.rtrim(*i + 1, *budget)
-                };
-                let style = if *i == nav.cursor_col() {
-                    style::selected().bold()
-                } else {
-                    style::primary().bold()
-                };
-                line.draw(format_args!("{header:<0$}", budget), style);
-                line.draw("  ", style::primary());
+                    let style = if *i == nav.cursor_col() {
+                        style::selected().bold()
+                    } else {
+                        style::primary().bold()
+                    };
+                    line.draw(
+                        format_args!("{:<1$}", self.fmt.rtrim(name, *budget), budget),
+                        style,
+                    );
+                }
+                line.draw("│", style::separator());
             }
         }
 
@@ -627,9 +644,10 @@ impl App {
             for (_, fields, stat, budget) in &cols {
                 let (ty, str) = fields[i];
                 line.draw(
-                    format_args!("{}  ", self.fmt.field(&ty, str, stat, *budget)),
+                    format_args!("{}", self.fmt.field(&ty, str, stat, *budget)),
                     style,
                 );
+                line.draw("│", style::separator());
             }
         }
     }

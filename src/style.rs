@@ -20,6 +20,10 @@ pub const fn selected() -> Style {
     none().fg(Color::DarkYellow)
 }
 
+pub fn separator() -> Style {
+    none().fg(Color::DarkGrey).dim()
+}
+
 pub fn state_action() -> Style {
     none().bg(Color::Green).bold()
 }

@@ -3,8 +3,6 @@ use std::ops::Range;
 use regex::bytes::Regex;
 use rust_decimal::Decimal;
 
-use crate::Cols;
-
 use super::lexer::{CmpOp, Lexer, LogiOp, MatchOp, Token, TokenKind};
 
 type Result<T> = std::result::Result<T, (Range<usize>, &'static str)>;
@@ -94,7 +92,7 @@ impl Highlighter {
             if let Some(token) = lexer.take_kind(TokenKind::Nb) {
                 self.add(token.span, Style::Id);
             }
-            if let Some(token) = lexer.take_kind(TokenKind::SepRange) {
+            if let Some(token) = lexer.take_kind(TokenKind::SepRangeLen) {
                 self.add(token.span, Style::Id);
             }
             if let Some(token) = lexer.take_kind(TokenKind::Nb) {
@@ -147,7 +145,7 @@ impl Highlighter {
 
     fn parse_action(&mut self, lexer: &mut Lexer) {
         let token = lexer.next();
-        if [TokenKind::Nb, TokenKind::Str, TokenKind::Id].contains(&token.kind) {
+        if token.kind == TokenKind::Nb {
             self.add(token.span, Style::Id)
         }
         self.parse_range(lexer);
@@ -191,16 +189,16 @@ impl Highlighter {
 struct Compiler<'a> {
     filter: Filter,
     lexer: Lexer<'a>,
-    cols: &'a Cols,
+    nb_col: usize,
 }
 
 impl<'a> Compiler<'a> {
-    fn compile(source: &'a str, cols: &'a Cols) -> Result<Filter> {
+    fn compile(source: &'a str, nb_col: usize) -> Result<Filter> {
         let source = source.trim();
         let mut compiler = Self {
             filter: Filter::empty(),
             lexer: Lexer::load(source),
-            cols,
+            nb_col,
         };
 
         if compiler.lexer.peek().kind != TokenKind::Eof {
@@ -230,19 +228,55 @@ impl<'a> Compiler<'a> {
         let token = self.lexer.peek();
         if token.kind == TokenKind::OpenRange {
             self.lexer.next();
-            let token = self.lexer.next();
-            let start = token
-                .str
-                .parse::<u32>()
-                .map_err(|_| (token.span, "Expect range start"))?;
-            self.expect(TokenKind::SepRange, "Expect :")?;
-            let token = self.lexer.next();
-            let end = token
-                .str
-                .parse::<u32>()
-                .map_err(|_| (token.span, "Expect range end"))?;
+            let (mut start, mut sep, mut end) = (None, None, None);
+            let mut token = self.lexer.peek();
+            let span_start = token.span.start;
+            // Parse range start
+            if TokenKind::Nb == token.kind {
+                start = Some(
+                    token
+                        .str
+                        .parse::<u32>()
+                        .map_err(|_| (token.span.clone(), "Expect range start"))?,
+                );
+                self.lexer.next();
+                token = self.lexer.peek();
+            }
+            // Parse range separator
+            match token.kind {
+                TokenKind::SepRangeLen => {
+                    self.lexer.next();
+                    token = self.lexer.peek();
+                    sep = Some(true)
+                }
+                TokenKind::SepRangeEnd => {
+                    self.lexer.next();
+                    token = self.lexer.peek();
+                    sep = Some(false)
+                }
+                _ => {},
+            };
+            // Parse range end
+            if TokenKind::Nb == token.kind {
+                end = Some(
+                    token
+                        .str
+                        .parse::<u32>()
+                        .map_err(|_| (token.span.clone(), "Expect range end"))?,
+                );
+                self.lexer.next();
+                token = self.lexer.peek();
+            }
+            let span_end = token.span.end;
             self.expect(TokenKind::CloseRange, "Expect ]")?;
-            Ok((start, end))
+            Ok(match (start, sep, end) {
+                (Some(start), None, None) => (start, start + 1),
+                (Some(start), Some(true), Some(len)) => (start, start + len),
+                (Some(start), Some(true), None) => (start, u32::MAX),
+                (None, Some(true), Some(len)) => (0, len),
+                (Some(start), Some(false), Some(end)) if start <= end => (start, end),
+                _ => return Err((span_start..span_end, "Invalid range")),
+            })
         } else {
             Ok((0, u32::MAX))
         }
@@ -313,25 +347,15 @@ impl<'a> Compiler<'a> {
         let id = match token.kind {
             TokenKind::Nb => {
                 if let Ok(nb) = token.str.parse::<u32>() {
-                    if nb == 0 {
-                        return Err((token.span, "Column index are > 0"));
-                    } else if nb > self.cols.visible_cols() as u32 {
+                    if nb as usize >= self.nb_col {
                         return Err((token.span, "No column with this index"));
-                    } else {
-                        nb - 1
                     }
+                    nb
                 } else {
                     return Err((token.span, "Expect a column index"));
                 }
             }
-            TokenKind::Str | TokenKind::Id => {
-                let name = token.str.trim_matches('"');
-                match self.cols.iter().position(|(_, header)| header == name) {
-                    Some(i) => i as u32,
-                    None => return Err((token.span, "No column with this name")),
-                }
-            }
-            _ => return Err((token.span, "Expect an id")),
+            _ => return Err((token.span, "Expect a column index")),
         };
         let range = self.parse_range()?;
         Ok((id, range))
@@ -400,7 +424,7 @@ impl Filter {
         }
     }
 
-    pub fn new(source: &str, cols: &Cols) -> Result<Self> {
-        Compiler::compile(source, cols)
+    pub fn new(source: &str, nb_col: usize) -> Result<Self> {
+        Compiler::compile(source, nb_col)
     }
 }
