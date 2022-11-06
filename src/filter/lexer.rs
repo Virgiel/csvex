@@ -104,7 +104,7 @@ impl<'a> Lexer<'a> {
         let until = self.source[self.offset..]
             .char_indices()
             .find_map(|(i, c)| (!c.is_whitespace()).then_some(i))
-            .unwrap_or(0);
+            .unwrap_or_else(|| self.source[self.offset..].len());
         self.offset += until;
         let remaining = &self.source[self.offset..];
         let bytes = remaining.as_bytes();

@@ -3,7 +3,7 @@ use rust_decimal::Decimal;
 use std::fmt::{Display, Write as is_empty};
 use tui::unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::{nb_print_len, BStrWidth};
+use crate::BStrWidth;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Ty {

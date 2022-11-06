@@ -95,6 +95,7 @@ impl Prompt {
                 self.pos = keep.then_some(0);
                 self.buffer.clear();
             }
+            PromptCmd::Jump(pos) => self.buffer.set_insertion_point(pos),
         }
     }
 
@@ -117,4 +118,5 @@ pub enum PromptCmd {
     Next,
     New(bool),
     Delete,
+    Jump(usize),
 }

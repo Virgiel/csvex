@@ -260,13 +260,16 @@ impl Cols {
 
     pub fn get_col(&self, idx: usize) -> (usize, &BStr) {
         let off = self.map[idx];
-        (off, self.headers.get(off).unwrap_or(BStr::new("?")))
+        (off, self.headers.get(off).unwrap_or_else(|| BStr::new("?")))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (usize, &BStr)> {
-        self.map
-            .iter()
-            .map(|off| (*off, self.headers.get(*off).unwrap_or(BStr::new("?"))))
+        self.map.iter().map(|off| {
+            (
+                *off,
+                self.headers.get(*off).unwrap_or_else(|| BStr::new("?")),
+            )
+        })
     }
 
     pub fn cmd(&mut self, idx: usize, cmd: ColsCmd) {
@@ -433,9 +436,10 @@ impl App {
                     KeyCode::Esc => self.state = AppState::Normal,
                     KeyCode::Tab => *show_off = !*show_off,
                     code => {
-                        if let Some(source) = self.filter_prompt.on_key(code) {
-                            match Filter::new(source, self.cols.nb_col) {
-                                Ok(filter) => {
+                        let (source, apply) = self.filter_prompt.on_key(code);
+                        match Filter::new(source, self.cols.nb_col) {
+                            Ok(filter) => {
+                                if apply {
                                     let (headers, index) =
                                         Indexer::index(&self.config, filter).unwrap();
                                     self.indexer = index;
@@ -443,8 +447,8 @@ impl App {
                                     self.state = AppState::Normal;
                                     self.filter_prompt.on_compile();
                                 }
-                                Err(err) => self.filter_prompt.on_error(err),
                             }
+                            Err(err) => self.filter_prompt.on_error(err, apply),
                         }
                     }
                 },

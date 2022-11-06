@@ -194,7 +194,6 @@ struct Compiler<'a> {
 
 impl<'a> Compiler<'a> {
     fn compile(source: &'a str, nb_col: usize) -> Result<Filter> {
-        let source = source.trim();
         let mut compiler = Self {
             filter: Filter::empty(),
             lexer: Lexer::load(source),
@@ -254,7 +253,7 @@ impl<'a> Compiler<'a> {
                     token = self.lexer.peek();
                     sep = Some(false)
                 }
-                _ => {},
+                _ => {}
             };
             // Parse range end
             if TokenKind::Nb == token.kind {

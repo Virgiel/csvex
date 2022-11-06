@@ -1,7 +1,12 @@
 use std::ops::Range;
 
 use reedline::LineBuffer;
-use tui::{crossterm::event::KeyCode, none, Canvas, Color, Line};
+use tui::{
+    crossterm::event::KeyCode,
+    none,
+    unicode_width::{UnicodeWidthChar, UnicodeWidthStr},
+    Canvas, Color, Line,
+};
 
 use crate::{
     filter::{Highlighter, Style},
@@ -134,29 +139,37 @@ impl FilterPrompt {
         }
     }
 
-    pub fn on_key(&mut self, code: KeyCode) -> Option<&str> {
+    pub fn on_key(&mut self, code: KeyCode) -> (&str, bool) {
         self.err = None;
         match code {
-            KeyCode::Char(c) => self.prompt.exec(PromptCmd::Write(c)),
+            KeyCode::Char(c) => {
+                self.prompt.exec(PromptCmd::Write(c));
+            }
             KeyCode::Left => self.prompt.exec(PromptCmd::Left),
             KeyCode::Right => self.prompt.exec(PromptCmd::Right),
             KeyCode::Up => self.prompt.exec(PromptCmd::Prev),
             KeyCode::Down => self.prompt.exec(PromptCmd::Next),
-            KeyCode::Backspace => self.prompt.exec(PromptCmd::Delete),
+            KeyCode::Backspace => {
+                self.prompt.exec(PromptCmd::Delete);
+            }
             KeyCode::Enter => {
                 let (str, _) = self.prompt.state();
-                return Some(str);
+                return (str, true);
             }
             _ => {}
         }
-        None
+        let (str, _) = self.prompt.state();
+        (str, false)
     }
 
     pub fn on_compile(&mut self) {
         self.prompt.exec(PromptCmd::New(true));
     }
 
-    pub fn on_error(&mut self, err: (Range<usize>, &'static str)) {
+    pub fn on_error(&mut self, err: (Range<usize>, &'static str), apply: bool) {
+        if apply {
+            self.prompt.exec(PromptCmd::Jump(err.0.start))
+        }
         self.err.replace(err);
     }
 
@@ -167,7 +180,54 @@ impl FilterPrompt {
         let mut highlighter = Highlighter::new(str);
         let mut pending_cursor = true;
 
-        for (i, c) in str.char_indices() {
+        let mut w = l.width();
+        self.offset = self.offset.min(cursor);
+
+        let mut before = str[..cursor].chars().rev();
+        let mut start = cursor;
+        let after = str[cursor..].chars();
+        let mut end = cursor;
+        // Read left until goal
+        loop {
+            if start == self.offset {
+                break;
+            }
+            if let Some(c) = before.next() {
+                let c_width = c.width().unwrap_or(0);
+                if c_width > 0 && w <= c_width {
+                    break;
+                }
+                w -= c_width;
+                start -= c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        self.offset = start;
+        // Read right until eof
+        for c in after {
+            let c_width = c.width().unwrap_or(0);
+            if c_width > 0 && w <= c_width {
+                break;
+            }
+            w -= c_width;
+            end += c.len_utf8();
+        }
+        // Read left until eof
+        for c in before {
+            let c_width = c.width().unwrap_or(0);
+            if c_width > 0 && w <= c_width {
+                break;
+            }
+            w -= c_width;
+            start -= c.len_utf8();
+        }
+
+        for (i, c) in str[start..end].char_indices() {
+            let i = start + i;
+            if l.width() == 1 {
+                break;
+            }
             if pending_cursor && cursor <= i {
                 l.cursor();
                 pending_cursor = false
@@ -187,16 +247,48 @@ impl FilterPrompt {
         if pending_cursor {
             l.cursor();
         }
+        // Draw error message
         if let Some((range, msg)) = &self.err {
-            c.btm().draw(
-                format_args!(
-                    "{s:<0$}{s:▾<1$} {msg}",
-                    range.start + 2,
-                    range.len(),
-                    s = ""
-                ),
-                none().fg(Color::Red),
-            );
+            let mut l = c.btm();
+            l.draw("  ", none());
+            if range.end >= start && range.start <= end {
+                let mut range = range.clone();
+                range.start = range.start.max(start);
+                range.end = range.end.min(end);
+                let space_left = str[start..range.start].width();
+                let space_right = str[range.end..end]
+                    .width()
+                    .max(l.width().saturating_sub(space_left + range.len() + 1));
+                if space_right > msg.width() && space_right >= space_left {
+                    l.draw(
+                        format_args!(
+                            "{s:<0$}{s:▾<1$} {msg}",
+                            range.start.saturating_sub(start),
+                            range.len(),
+                            s = ""
+                        ),
+                        none().fg(Color::Red),
+                    );
+                } else if space_left > msg.width() {
+                    l.rdraw(
+                        format_args!(
+                            "{msg} {s:▾<1$}{s:<0$}",
+                            l.width().saturating_sub(range.end.saturating_sub(start)),
+                            range.len(),
+                            s = ""
+                        ),
+                        none().fg(Color::Red),
+                    );
+                } else {
+                    l.draw(format_args!("{msg}"), none().fg(Color::Red));
+                }
+            } else {
+                if range.start > end {
+                    l.rdraw(format_args!("{msg} ▸"), none().fg(Color::Red));
+                } else {
+                    l.draw(format_args!("◂ {msg}"), none().fg(Color::Red));
+                }
+            }
         }
     }
 
