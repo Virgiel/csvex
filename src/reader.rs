@@ -15,18 +15,11 @@ pub struct CsvReader {
 }
 
 impl CsvReader {
-    pub(crate) fn from_file(file: BufReader<File>, delimiter: u8) -> Self {
+    pub(crate) fn new(file: BufReader<File>, delimiter: u8) -> Self {
         Self {
             file,
             rdr: csv_core::ReaderBuilder::new().delimiter(delimiter).build(),
         }
-    }
-
-    pub(crate) fn new(path: &str, delimiter: u8) -> io::Result<Self> {
-        Ok(Self::from_file(
-            BufReader::new(File::open(path)?),
-            delimiter,
-        ))
     }
 
     /// Read a record into a nested string

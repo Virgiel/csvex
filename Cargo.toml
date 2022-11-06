@@ -21,6 +21,11 @@ rust_decimal = { version = "1.26.1", default-features = false }
 regex = "1.7.0"
 # Line editor tool
 reedline = "0.13.0"
+# Temporary file
+tempfile = "3.3.0"
+# CLI args parser
+clap = { version = "4.0.19", features = ["derive"] }
+
 
 # Optimal size and perf
 [profile.release]

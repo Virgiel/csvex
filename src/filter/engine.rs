@@ -3,7 +3,7 @@ use std::{fmt::Display, io::Write, ops::Range};
 use bstr::{BStr, ByteSlice};
 use rust_decimal::Decimal;
 
-use crate::read::NestedString;
+use crate::reader::NestedString;
 
 use super::{
     compiler::{Col, Filter, Node, Value},

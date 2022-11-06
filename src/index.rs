@@ -11,7 +11,8 @@ use parking_lot::Mutex;
 
 use crate::{
     filter::{Engine, Filter},
-    read::{Config, CsvReader, NestedString},
+    reader::{CsvReader, NestedString},
+    source::Source,
 };
 
 struct State {
@@ -28,10 +29,10 @@ pub struct Indexer {
 }
 
 impl Indexer {
-    pub fn index(config: &Config, filter: Filter) -> io::Result<(NestedString, Self)> {
-        let mut rdr = config.reader()?;
+    pub fn index(source: &Source, filter: Filter) -> io::Result<(NestedString, Self)> {
+        let mut rdr = source.reader()?;
         let mut headers = NestedString::new();
-        if config.has_header {
+        if source.has_header {
             rdr.record(&mut headers)?;
         }
         let state = Arc::new(State {

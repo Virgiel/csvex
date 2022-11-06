@@ -1,15 +1,17 @@
 use std::{
     io::{self},
     ops::Add,
+    path::PathBuf,
     time::Duration,
 };
 
 use bstr::{BStr, ByteSlice};
+use clap::Parser;
 use filter::Filter;
 use fmt::{ColStat, Fmt, Ty};
 use index::Indexer;
-use read::{Config, CsvReader, NestedString};
-use source::FileWatcher;
+use reader::{CsvReader, NestedString};
+use source::Source;
 use spinner::Spinner;
 use tui::{
     crossterm::event::{self, Event, KeyCode, KeyModifiers},
@@ -22,7 +24,7 @@ mod filter;
 mod fmt;
 mod index;
 mod prompt;
-mod read;
+mod reader;
 mod source;
 mod spinner;
 mod style;
@@ -33,16 +35,18 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub const BUF_LEN: usize = 8 * 1024;
 
+#[derive(clap::Parser, Debug)]
+pub struct Args {
+    pub filename: Option<PathBuf>,
+}
+
 pub fn nb_print_len(nb: usize) -> usize {
     (nb as f64).log10() as usize + 1
 }
 
 fn main() {
-    let path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "../../Downloads/adresses-france.csv".to_string());
-    let mut app = App::open(path.clone()).unwrap();
-    let mut watcher = FileWatcher::new(path).unwrap();
+    let args = Args::parse();
+    let mut app = App::open(args.filename).unwrap();
     let mut redraw = true;
     let mut terminal = Terminal::new(io::stdout()).unwrap();
     loop {
@@ -62,10 +66,6 @@ fn main() {
                     break;
                 }
             }
-            redraw = true;
-        }
-        if watcher.has_change().unwrap() {
-            app.on_file_change();
             redraw = true;
         }
         if is_loading {
@@ -347,7 +347,7 @@ enum AppState {
 }
 
 struct App {
-    config: Config,
+    source: Source,
     rdr: CsvReader,
     grid: Grid,
     nav: Nav,
@@ -362,12 +362,12 @@ struct App {
 }
 
 impl App {
-    pub fn open(path: String) -> io::Result<Self> {
-        let (config, rdr) = Config::sniff(path)?;
-        let (headers, index) = Indexer::index(&config, Filter::empty())?;
+    pub fn open(filename: Option<PathBuf>) -> io::Result<Self> {
+        let (source, rdr) = Source::new(filename)?;
+        let (headers, index) = Indexer::index(&source, Filter::empty())?;
         Ok(Self {
+            source,
             rdr,
-            config,
             indexer: index,
             grid: Grid::new(),
             nav: Nav::new(),
@@ -386,18 +386,13 @@ impl App {
     }
 
     pub fn refresh(&mut self) {
-        let (config, rdr) = Config::sniff(self.config.path.clone()).unwrap();
-        let (headers, index) = Indexer::index(&config, Filter::empty()).unwrap();
-        self.config = config;
+        let rdr = self.source.refresh().unwrap();
+        let (headers, index) = Indexer::index(&self.source, Filter::empty()).unwrap();
         self.rdr = rdr;
         self.indexer = index;
         self.cols.set_headers(headers);
         self.grid = Grid::new();
         self.dirty = false;
-    }
-
-    pub fn on_file_change(&mut self) {
-        self.dirty = true;
     }
 
     pub fn on_event(&mut self, event: Event) -> bool {
@@ -441,7 +436,7 @@ impl App {
                             Ok(filter) => {
                                 if apply {
                                     let (headers, index) =
-                                        Indexer::index(&self.config, filter).unwrap();
+                                        Indexer::index(&self.source, filter).unwrap();
                                     self.indexer = index;
                                     self.cols.set_headers(headers);
                                     self.state = AppState::Normal;
@@ -489,6 +484,10 @@ impl App {
     }
 
     pub fn draw(&mut self, c: &mut Canvas) {
+        if !self.dirty {
+            self.dirty = self.source.check_dirty().unwrap();
+        }
+
         let w = c.width();
         // Draw error bar
         if self.dirty {
@@ -593,7 +592,7 @@ impl App {
                 if let Some(filter) = self.indexer.filter() {
                     FilterPrompt::draw_status(&mut l, filter)
                 } else {
-                    l.draw(&self.config.path, style::progress());
+                    l.draw(&self.source.display_path, style::progress());
                 }
             }
         }
@@ -604,7 +603,7 @@ impl App {
             AppState::Nav(navigator) => navigator.nav(),
             _ => &mut self.nav,
         };
-        if self.config.has_header || show_off {
+        if self.source.has_header || show_off {
             let line = &mut c.top();
             line.draw(
                 format_args!("{:>1$} ", '#', id_len),
