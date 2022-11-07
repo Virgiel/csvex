@@ -88,11 +88,13 @@ impl Source {
         Ok(rdr)
     }
 
-    pub fn reader(&self) -> io::Result<CsvReader> {
-        Ok(CsvReader::new(
-            BufReader::new(self.kind.open()?),
-            self.delimiter,
-        ))
+    pub fn reader(&self) -> io::Result<(CsvReader, NestedString)> {
+        let mut rdr = CsvReader::new(BufReader::new(self.kind.open()?), self.delimiter);
+        let mut headers = NestedString::new();
+        if self.has_header {
+            rdr.record(&mut headers)?;
+        }
+        Ok((rdr, headers))
     }
 
     pub fn check_dirty(&mut self) -> std::io::Result<bool> {

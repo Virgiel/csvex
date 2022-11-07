@@ -30,11 +30,7 @@ pub struct Indexer {
 
 impl Indexer {
     pub fn index(source: &Source, filter: Filter) -> io::Result<(NestedString, Self)> {
-        let mut rdr = source.reader()?;
-        let mut headers = NestedString::new();
-        if source.has_header {
-            rdr.record(&mut headers)?;
-        }
+        let (mut rdr, headers) = source.reader()?;
         let state = Arc::new(State {
             index: Mutex::new(Vec::with_capacity(1000)),
             filter,
@@ -109,7 +105,11 @@ impl Indexer {
         rows.map_while(|i| locked.get(i).copied()).collect()
     }
 
-    pub fn filter(&self) -> Option<&str> {
+    pub fn filter(&self) -> &Filter {
+        &self.state.filter
+    }
+
+    pub fn filter_string(&self) -> Option<&str> {
         (!self.state.filter.nodes.is_empty()).then_some(self.state.filter.source.as_str())
     }
 

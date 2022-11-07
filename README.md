@@ -24,6 +24,7 @@ csvex <filename>
 | `K` or `Maj →` | Move current col to the right |
 | `-`            | Hide current col              |
 | `/`            | Switch to filter mode         |
+| `f`            | Switch to frequency mode      |
 | `s`            | Switch to size mode           |
 | `g`            | Switch to navigation mode     |
 | `r`            | Reload file content           |
@@ -37,6 +38,14 @@ csvex <filename>
 | `Tab`   | Toggle col index view |
 | `Enter` | Apply filter          |
 | other   | Write into prompt     |
+
+### Frequency
+
+| Key        | Action                |
+| ---------- | --------------------- |
+| `Esc`      | Return to normal mode |
+| `k` or `↑` | Move cursor up        |
+| `j` or `↓` | Move cursor down      |
 
 ### Size
 

@@ -7,9 +7,12 @@ use std::{
 
 use bstr::{BStr, ByteSlice};
 use clap::Parser;
+use cols::{Cols, ColsCmd, SizeCmd};
 use filter::Filter;
 use fmt::{ColStat, Fmt, Ty};
+use histogram::Histographer;
 use index::Indexer;
+use nav::Nav;
 use reader::{CsvReader, NestedString};
 use source::Source;
 use spinner::Spinner;
@@ -20,9 +23,12 @@ use tui::{
 };
 use ui::{FilterPrompt, Navigator};
 
+mod cols;
 mod filter;
 mod fmt;
+mod histogram;
 mod index;
+mod nav;
 mod prompt;
 mod reader;
 mod source;
@@ -74,276 +80,21 @@ fn main() {
     }
 }
 
-#[derive(Clone)]
-pub struct Nav {
-    // Offset position
-    o_row: usize,
-    o_col: usize,
-    // Cursor positions
-    c_row: usize,
-    c_col: usize,
-    // View dimension
-    v_row: usize,
-    v_col: usize,
-    // Max
-    m_row: usize,
-    m_col: usize,
-}
-
-impl Nav {
-    pub fn new() -> Self {
-        Self {
-            o_row: 0,
-            o_col: 0,
-            c_row: 0,
-            c_col: 0,
-            v_row: 0,
-            v_col: 0,
-            m_row: 0,
-            m_col: 0,
-        }
-    }
-
-    pub fn up(&mut self) {
-        self.c_row = self.c_row.saturating_sub(1);
-    }
-
-    pub fn down(&mut self) {
-        self.c_row = self.c_row.saturating_add(1);
-    }
-
-    pub fn left(&mut self) {
-        self.c_col = self.c_col.saturating_sub(1);
-    }
-
-    pub fn right(&mut self) {
-        self.c_col = self.c_col.saturating_add(1);
-    }
-
-    pub fn full_up(&mut self) {
-        self.c_row = 0;
-    }
-
-    pub fn full_down(&mut self) {
-        self.c_row = self.m_row;
-    }
-
-    pub fn full_left(&mut self) {
-        self.c_col = 0;
-    }
-
-    pub fn full_right(&mut self) {
-        self.c_col = self.m_col;
-    }
-
-    pub fn row_offset(&mut self, total: usize, nb: usize) -> usize {
-        self.m_row = total.saturating_sub(1);
-        // Sync view dimension
-        self.v_row = nb;
-        // Ensure cursor pos fit in grid dimension
-        self.c_row = self.c_row.min(self.m_row);
-        // Ensure cursor is in view
-        if self.c_row < self.o_row {
-            self.o_row = self.c_row;
-        } else if self.c_row >= self.o_row + self.v_row {
-            self.o_row = self.c_row - self.v_row + 1;
-        }
-        self.o_row
-    }
-
-    pub fn col_iter(&mut self, total: usize, mut fit: impl FnMut(usize) -> bool) {
-        self.m_col = total.saturating_sub(1);
-        // Ensure cursor pos fit in grid dimension
-        self.c_col = self.c_col.min(self.m_col);
-        // Ensure cursor is in view
-        if self.c_col < self.o_col {
-            self.o_col = self.c_col;
-        }
-
-        self.v_col = 0;
-        let goal_l = self.o_col;
-        self.o_col = self.c_col;
-        if total > 0 {
-            loop {
-                let off = if goal_l + self.v_col <= self.c_col {
-                    // Fill left until goal
-                    self.c_col - self.v_col
-                } else if goal_l + self.v_col <= self.m_col {
-                    // Then fill right
-                    goal_l + self.v_col
-                } else if self.v_col <= self.m_col {
-                    // Then fill left
-                    self.m_col - self.v_col
-                } else {
-                    // No more columns
-                    break;
-                };
-                self.v_col += 1;
-                let is_fitting = fit(off);
-                if is_fitting || off >= goal_l {
-                    self.o_col = self.o_col.min(off);
-                }
-                if !is_fitting {
-                    break;
-                }
-            }
-        }
-    }
-
-    pub fn cursor_row(&self) -> usize {
-        self.c_row - self.o_row
-    }
-
-    pub fn cursor_col(&self) -> usize {
-        self.c_col
-    }
-
-    pub fn go_to(&mut self, (row, col): (usize, usize)) {
-        self.c_row = row;
-        self.c_col = col;
-    }
-}
-
-pub enum ColsCmd {
-    Hide,
-    Left,
-    Right,
-}
-
-pub enum SizeCmd {
-    Constrain,
-    Full,
-    Less,
-    More,
-}
-
-#[derive(Clone, Copy)]
-enum Constraint {
-    Constrained,
-    Full,
-    Defined(usize),
-}
-
-pub struct Cols {
-    headers: NestedString,
-    map: Vec<usize>,
-    size: Vec<(usize, Constraint)>,
-    nb_col: usize,
-    max_col: usize,
-}
-
-impl Cols {
-    pub fn new(headers: NestedString) -> Self {
-        Self {
-            headers,
-            map: vec![],
-            size: vec![],
-            nb_col: 0,
-            max_col: 0,
-        }
-    }
-
-    pub fn set_nb_cols(&mut self, nb_col: usize) {
-        if nb_col > self.size.len() {
-            self.size.resize(nb_col, (0, Constraint::Constrained));
-        }
-        for i in self.max_col..nb_col {
-            self.map.push(i);
-        }
-        self.nb_col = nb_col;
-        self.max_col = self.max_col.max(self.nb_col);
-    }
-
-    pub fn visible_cols(&self) -> usize {
-        self.map.len()
-    }
-
-    pub fn get_col(&self, idx: usize) -> (usize, &BStr) {
-        let off = self.map[idx];
-        (off, self.headers.get(off).unwrap_or_else(|| BStr::new("?")))
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (usize, &BStr)> {
-        self.map.iter().map(|off| {
-            (
-                *off,
-                self.headers.get(*off).unwrap_or_else(|| BStr::new("?")),
-            )
-        })
-    }
-
-    pub fn cmd(&mut self, idx: usize, cmd: ColsCmd) {
-        if self.visible_cols() == 0 {
-            return;
-        }
-        match cmd {
-            ColsCmd::Hide => {
-                self.map.remove(idx);
-            }
-            ColsCmd::Left => self.map.swap(idx, idx.saturating_sub(1)),
-            ColsCmd::Right => {
-                if idx < self.map.len() - 1 {
-                    self.map.swap(idx, idx + 1);
-                }
-            }
-        }
-    }
-
-    pub fn set_headers(&mut self, headers: NestedString) {
-        self.headers = headers;
-    }
-
-    fn offset(&self, idx: usize) -> usize {
-        self.map[idx]
-    }
-
-    /* ----- Sizing ----- */
-
-    pub fn size(&mut self, idx: usize, len: usize) -> usize {
-        let off = self.offset(idx);
-        self.size[off].0 = self.size[off].0.max(len);
-        self.get_size(idx)
-    }
-
-    fn get_size(&mut self, idx: usize) -> usize {
-        let off = self.offset(idx);
-        let (size, constraint) = self.size[off];
-        match constraint {
-            Constraint::Constrained => size.min(25),
-            Constraint::Full => size,
-            Constraint::Defined(size) => size,
-        }
-    }
-
-    pub fn reset_size(&mut self) {
-        self.size.clear();
-    }
-
-    pub fn fit(&mut self) {
-        for (s, _) in &mut self.size {
-            *s = 0;
-        }
-    }
-
-    pub fn size_cmd(&mut self, idx: usize, cmd: SizeCmd) {
-        if self.visible_cols() == 0 {
-            return;
-        }
-        let off = self.offset(idx);
-        self.size[off].1 = match cmd {
-            SizeCmd::Constrain => Constraint::Constrained,
-            SizeCmd::Full => Constraint::Full,
-            SizeCmd::Less => Constraint::Defined(self.get_size(idx).saturating_sub(1)),
-            SizeCmd::More => Constraint::Defined(self.get_size(idx).saturating_add(1)),
-        };
-    }
-}
-
 enum AppState {
     Normal,
     Filter { show_off: bool },
     Size,
     Nav(Navigator),
+    Histogram(Histographer),
+}
+
+enum GridType<'a> {
+    Normal {
+        id_len: usize,
+        cols: Vec<(usize, Vec<(Ty, &'a BStr)>, ColStat, usize)>,
+        rows: &'a [(u32, NestedString)],
+    },
+    Histogram,
 }
 
 struct App {
@@ -382,7 +133,10 @@ impl App {
     }
 
     pub fn is_loading(&self) -> bool {
-        self.indexer.is_loading()
+        match &self.state {
+            AppState::Histogram(h) => h.is_loading(),
+            _ => self.indexer.is_loading(),
+        }
     }
 
     pub fn refresh(&mut self) {
@@ -393,6 +147,10 @@ impl App {
         self.cols.set_headers(headers);
         self.grid = Grid::new();
         self.dirty = false;
+        if let AppState::Histogram(h) = &mut self.state {
+            let (off, _) = self.cols.get_col(self.nav.c_col);
+            *h = Histographer::analyze(&self.source, off, self.indexer.filter().clone()).unwrap();
+        }
     }
 
     pub fn on_event(&mut self, event: Event) -> bool {
@@ -425,6 +183,13 @@ impl App {
                     KeyCode::Char('g') => {
                         self.state = AppState::Nav(Navigator::new(self.nav.clone()))
                     }
+                    KeyCode::Char('f') => {
+                        let (off, _) = self.cols.get_col(self.nav.c_col);
+                        self.state = AppState::Histogram(
+                            Histographer::analyze(&self.source, off, self.indexer.filter().clone())
+                                .unwrap(),
+                        )
+                    }
                     _ => {}
                 },
                 AppState::Filter { show_off } => match event.code {
@@ -432,7 +197,7 @@ impl App {
                     KeyCode::Tab => *show_off = !*show_off,
                     code => {
                         let (source, apply) = self.filter_prompt.on_key(code);
-                        match Filter::new(source, self.cols.nb_col) {
+                        match Filter::new(source, self.cols.nb_col()) {
                             Ok(filter) => {
                                 if apply {
                                     let (headers, index) =
@@ -478,6 +243,12 @@ impl App {
                         self.state = AppState::Normal;
                     }
                 }
+                AppState::Histogram(h) => match event.code {
+                    KeyCode::Esc => self.state = AppState::Normal,
+                    KeyCode::Down | KeyCode::Char('j') => h.down(),
+                    KeyCode::Up | KeyCode::Char('k') => h.up(),
+                    _ => {}
+                },
             }
         }
         false
@@ -504,84 +275,93 @@ impl App {
             AppState::Nav(navigator) => {
                 navigator.draw_prompt(c);
             }
-            AppState::Normal | AppState::Size => {}
+            AppState::Normal | AppState::Size | AppState::Histogram(_) => {}
         }
 
-        let nav = match &mut self.state {
-            AppState::Nav(navigator) => navigator.nav(),
-            _ => &mut self.nav,
-        };
-
-        // Sync state with indexer
-        let nb_col = self.indexer.nb_col();
-        let nb_row = self.indexer.nb_row();
-        let is_loading = self.indexer.is_loading();
-        self.cols.set_nb_cols(nb_col);
-        let visible_cols = self.cols.visible_cols();
-        // Get rows content
         let nb_draw_row = c.height().saturating_sub(2);
-        let row_off = nav.row_offset(nb_row, nb_draw_row);
-        let offsets = self.indexer.get_offsets(row_off..row_off + nb_draw_row);
-        self.grid.read_rows(&offsets, &mut self.rdr).unwrap();
-        let rows = self.grid.rows();
-        let id_len = rows
-            .last()
-            .map(|(i, _)| (*i as f32 + 1.).log10() as usize + 1)
-            .unwrap_or(1);
-        let mut remain_table_w = c.width() - id_len as usize - 1;
-        let mut cols = Vec::new();
-        nav.col_iter(visible_cols, |idx| {
-            let remain_col_w = remain_table_w.saturating_sub(cols.len());
-            if remain_col_w > 0 {
-                let (fields, mut stat) = rows
-                    .iter()
-                    .map(|(_, n)| n.get(self.cols.get_col(idx).0).unwrap_or_default())
-                    .fold(
-                        (Vec::new(), ColStat::new()),
-                        |(mut vec, mut stat), content| {
-                            let ty = Ty::guess(content);
-                            stat.add(&ty, content);
-                            vec.push((ty, content));
-                            (vec, stat)
-                        },
-                    );
-                let name = self.cols.get_col(idx).1;
-                stat.header_name(name);
-                let col_size = self.cols.size(idx, stat.budget());
-                let allowed = col_size.min(remain_col_w);
-                remain_table_w = remain_table_w.saturating_sub(allowed);
-                cols.push((idx, fields, stat, allowed));
-                remain_col_w >= col_size
-            } else {
-                false
+        let (progress, ty) = match &mut self.state {
+            AppState::Histogram(h) => (h.ui_progress(nb_draw_row), GridType::Histogram),
+            _ => {
+                let nav = match &mut self.state {
+                    AppState::Nav(navigator) => navigator.nav(),
+                    _ => &mut self.nav,
+                };
+                // Sync state with indexer
+                let nb_col = self.indexer.nb_col();
+                let nb_row = self.indexer.nb_row();
+                self.cols.set_nb_cols(nb_col);
+                let visible_cols = self.cols.visible_col();
+                // Get rows content
+                let row_off = nav.row_offset(nb_row, nb_draw_row);
+                let offsets = self.indexer.get_offsets(row_off..row_off + nb_draw_row);
+                self.grid.read_rows(&offsets, &mut self.rdr).unwrap();
+                let rows = self.grid.rows();
+                let id_len = rows
+                    .last()
+                    .map(|(i, _)| (*i as f32 + 1.).log10() as usize + 1)
+                    .unwrap_or(1);
+                let mut remain_table_w = c.width() - id_len as usize - 1;
+                let mut cols = Vec::new();
+                nav.col_iter(visible_cols, |idx| {
+                    let remain_col_w = remain_table_w.saturating_sub(cols.len());
+                    if remain_col_w > 0 {
+                        let (fields, mut stat) = rows
+                            .iter()
+                            .map(|(_, n)| n.get(self.cols.get_col(idx).0).unwrap_or_default())
+                            .fold(
+                                (Vec::new(), ColStat::new()),
+                                |(mut vec, mut stat), content| {
+                                    let ty = Ty::guess(content);
+                                    stat.add(&ty, content);
+                                    vec.push((ty, content));
+                                    (vec, stat)
+                                },
+                            );
+                        let name = self.cols.get_col(idx).1;
+                        stat.header_name(name);
+                        let col_size = self.cols.size(idx, stat.budget());
+                        let allowed = col_size.min(remain_col_w);
+                        remain_table_w = remain_table_w.saturating_sub(allowed);
+                        cols.push((idx, fields, stat, allowed));
+                        remain_col_w >= col_size
+                    } else {
+                        false
+                    }
+                });
+                cols.sort_unstable_by_key(|(i, _, _, _)| *i); // Find a way to store col in order
+                (
+                    ((self.nav.c_row + 1) * 100) / nb_row.max(1),
+                    GridType::Normal { id_len, cols, rows },
+                )
             }
-        });
-        cols.sort_unstable_by_key(|(i, _, _, _)| *i); // Find a way to store col in order
+        };
 
         // Draw status bar
         let mut l = c.btm();
         match &self.state {
-            AppState::Filter { .. } => l.draw(" FILTER ", style::state_filter()),
-            AppState::Normal if self.indexer.filter().is_some() => {
-                l.draw(" FILTER ", style::state_filter())
+            AppState::Filter { .. } => l.draw(" FILTER ", style::state_alternate()),
+            AppState::Normal if self.indexer.filter_string().is_some() => {
+                l.draw(" FILTER ", style::state_alternate())
             }
             AppState::Normal => l.draw(" NORMAL ", style::state_default()),
             AppState::Size => l.draw("  SIZE  ", style::state_action()),
             AppState::Nav(_) => l.draw("  GOTO  ", style::state_action()),
+            AppState::Histogram(_) => l.draw("  FREQ  ", style::state_alternate()),
         };
         l.draw(" ", style::primary());
-        if let Some(char) = self.spinner.state(is_loading) {
-            l.rdraw(
-                format_args!(" {:>2}%{char}", self.indexer.progress()),
-                style::progress(),
-            );
+
+        if let Some(char) = self.spinner.state(self.is_loading()) {
+            let progress = match &self.state {
+                AppState::Histogram(h) => h.progress(),
+                _ => self.indexer.progress(),
+            };
+            l.rdraw(format_args!(" {:>2}%{char}", progress), style::progress());
         } else {
-            let progress = ((self.nav.c_row + 1) * 100) / nb_row.max(1);
             l.rdraw(format_args!(" {progress:>3}%"), style::primary());
         }
 
-        if self.cols.nb_col > 0 {
-            let (_, name) = self.cols.get_col(self.nav.cursor_col());
+        if self.cols.nb_col() > 0 {
+            let (_, name) = self.cols.get_col(self.nav.c_col);
             l.rdraw(name, style::primary());
             l.rdraw(" ", style::primary());
         }
@@ -589,7 +369,7 @@ impl App {
         match &self.state {
             AppState::Nav(navigator) => navigator.draw_status(&mut l, &mut self.fmt),
             _ => {
-                if let Some(filter) = self.indexer.filter() {
+                if let Some(filter) = self.indexer.filter_string() {
                     FilterPrompt::draw_status(&mut l, filter)
                 } else {
                     l.draw(&self.source.display_path, style::progress());
@@ -597,60 +377,71 @@ impl App {
             }
         }
 
-        // Draw headers
-        let show_off = matches!(self.state, AppState::Filter { show_off: true });
-        let nav = match &mut self.state {
-            AppState::Nav(navigator) => navigator.nav(),
-            _ => &mut self.nav,
-        };
-        if self.source.has_header || show_off {
-            let line = &mut c.top();
-            line.draw(
-                format_args!("{:>1$} ", '#', id_len),
-                style::secondary().bold(),
-            );
-
-            for (i, _, _, budget) in &cols {
-                let (off, name) = self.cols.get_col(*i);
-
-                if show_off {
-                    let style = if *i == nav.cursor_col() {
-                        style::selected().bold()
-                    } else {
-                        style::secondary().bold()
-                    };
-                    line.draw(format_args!("{off:<0$}", budget), style);
-                } else {
-                    let style = if *i == nav.cursor_col() {
-                        style::selected().bold()
-                    } else {
-                        style::primary().bold()
-                    };
+        match ty {
+            GridType::Normal { id_len, cols, rows } => {
+                // Draw headers
+                let show_off = matches!(self.state, AppState::Filter { show_off: true });
+                let nav = match &mut self.state {
+                    AppState::Nav(navigator) => navigator.nav(),
+                    _ => &mut self.nav,
+                };
+                if self.source.has_header || show_off {
+                    let line = &mut c.top();
                     line.draw(
-                        format_args!("{:<1$}", self.fmt.rtrim(name, *budget), budget),
-                        style,
+                        format_args!("{:>1$} ", '#', id_len),
+                        style::secondary().bold(),
                     );
-                }
-                line.draw("│", style::separator());
-            }
-        }
 
-        // Draw rows
-        for (i, (e, _)) in rows.iter().enumerate() {
-            let style = if i == nav.cursor_row() {
-                style::selected()
-            } else {
-                style::primary()
-            };
-            let line = &mut c.top();
-            line.draw(format_args!("{:>1$} ", *e + 1, id_len), style::secondary());
-            for (_, fields, stat, budget) in &cols {
-                let (ty, str) = fields[i];
-                line.draw(
-                    format_args!("{}", self.fmt.field(&ty, str, stat, *budget)),
-                    style,
-                );
-                line.draw("│", style::separator());
+                    for (i, _, _, budget) in &cols {
+                        let (off, name) = self.cols.get_col(*i);
+
+                        if show_off {
+                            let style = if *i == nav.c_col {
+                                style::selected().bold()
+                            } else {
+                                style::secondary().bold()
+                            };
+                            line.draw(format_args!("{off:<0$}", budget), style);
+                        } else {
+                            let style = if *i == nav.c_col {
+                                style::selected().bold()
+                            } else {
+                                style::primary().bold()
+                            };
+                            line.draw(
+                                format_args!("{:<1$}", self.fmt.rtrim(name, *budget), budget),
+                                style,
+                            );
+                        }
+                        line.draw("│", style::separator());
+                    }
+                }
+
+                // Draw rows
+                for (i, (e, _)) in rows.iter().enumerate() {
+                    let style = if i == nav.c_row - nav.o_row {
+                        style::selected()
+                    } else {
+                        style::primary()
+                    };
+                    let line = &mut c.top();
+                    line.draw(format_args!("{:>1$} ", *e + 1, id_len), style::secondary());
+                    for (_, fields, stat, budget) in &cols {
+                        let (ty, str) = fields[i];
+                        line.draw(
+                            format_args!("{}", self.fmt.field(&ty, str, stat, *budget)),
+                            style,
+                        );
+                        line.draw("│", style::separator());
+                    }
+                }
+            }
+            GridType::Histogram => {
+                if let AppState::Histogram(h) = &mut self.state {
+                    h.draw_grid(c, &mut self.fmt)
+                } else {
+                    unreachable!()
+                }
             }
         }
     }

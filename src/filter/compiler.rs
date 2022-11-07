@@ -8,6 +8,7 @@ use super::lexer::{CmpOp, Lexer, LogiOp, MatchOp, Token, TokenKind};
 type Result<T> = std::result::Result<T, (Range<usize>, &'static str)>;
 pub type Col = (u32, (u32, u32));
 
+#[derive(Clone)]
 pub enum Node {
     // Action
     Exist(Col),
@@ -31,6 +32,7 @@ pub enum Node {
     },
 }
 
+#[derive(Clone)]
 pub enum Value {
     Nb(Decimal),
     Str(Range<usize>),
@@ -404,6 +406,7 @@ impl<'a> Compiler<'a> {
     }
 }
 
+#[derive(Clone)]
 pub struct Filter {
     pub(crate) values: Vec<Value>,
     pub(crate) regex: Vec<Regex>,

@@ -25,6 +25,8 @@ reedline = "0.13.0"
 tempfile = "3.3.0"
 # CLI args parser
 clap = { version = "4.0.19", features = ["derive"] }
+# Indexed hashmap
+indexmap = "1.9.1"
 
 
 # Optimal size and perf

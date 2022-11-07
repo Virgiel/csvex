@@ -28,7 +28,7 @@ pub fn state_action() -> Style {
     none().bg(Color::Green).bold()
 }
 
-pub fn state_filter() -> Style {
+pub fn state_alternate() -> Style {
     none().bg(Color::Magenta).bold()
 }
 
