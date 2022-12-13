@@ -16,17 +16,17 @@ bstr = "1.0.1"
 # Efficient locks
 parking_lot = "0.12.1"
 # Precise decimal
-rust_decimal = { version = "1.26.1", default-features = false }
+rust_decimal = { version = "1.27.0", default-features = false }
 # Regular expression lib
 regex = "1.7.0"
 # Line editor tool
-reedline = "0.13.0"
+reedline = "0.14.0"
 # Temporary file
 tempfile = "3.3.0"
 # CLI args parser
-clap = { version = "4.0.19", features = ["derive"] }
+clap = { version = "4.0.29", features = ["derive"] }
 # Indexed hashmap
-indexmap = "1.9.1"
+indexmap = "1.9.2"
 
 
 # Optimal size and perf
