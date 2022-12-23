@@ -385,36 +385,34 @@ impl App {
                     AppState::Nav(navigator) => navigator.nav(),
                     _ => &mut self.nav,
                 };
-                if self.source.has_header || show_off {
-                    let line = &mut c.top();
-                    line.draw(
-                        format_args!("{:>1$} ", '#', id_len),
-                        style::secondary().bold(),
-                    );
+                let line = &mut c.top();
+                line.draw(
+                    format_args!("{:>1$} ", '#', id_len),
+                    style::secondary().bold(),
+                );
 
-                    for (i, _, _, budget) in &cols {
-                        let (off, name) = self.cols.get_col(*i);
+                for (i, _, _, budget) in &cols {
+                    let (off, name) = self.cols.get_col(*i);
 
-                        if show_off {
-                            let style = if *i == nav.c_col {
-                                style::selected().bold()
-                            } else {
-                                style::secondary().bold()
-                            };
-                            line.draw(format_args!("{off:<0$}", budget), style);
+                    if show_off {
+                        let style = if *i == nav.c_col {
+                            style::selected().bold()
                         } else {
-                            let style = if *i == nav.c_col {
-                                style::selected().bold()
-                            } else {
-                                style::primary().bold()
-                            };
-                            line.draw(
-                                format_args!("{:<1$}", self.fmt.rtrim(name, *budget), budget),
-                                style,
-                            );
-                        }
-                        line.draw("│", style::separator());
+                            style::secondary().bold()
+                        };
+                        line.draw(format_args!("{off:<0$}", budget), style);
+                    } else {
+                        let style = if *i == nav.c_col {
+                            style::selected().bold()
+                        } else {
+                            style::primary().bold()
+                        };
+                        line.draw(
+                            format_args!("{:<1$}", self.fmt.rtrim(name, *budget), budget),
+                            style,
+                        );
                     }
+                    line.draw("│", style::separator());
                 }
 
                 // Draw rows
