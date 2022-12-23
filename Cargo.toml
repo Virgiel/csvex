@@ -12,7 +12,7 @@ tui = { path = "../tui" } #git = "https://github.com/Virgiel/tui" }
 csv = "1.1.6"
 csv-core = "0.1.10"
 # Conventional UTF-8 string
-bstr = "1.0.1"
+bstr = "1.1.0"
 # Efficient locks
 parking_lot = "0.12.1"
 # Precise decimal
@@ -24,7 +24,7 @@ reedline = "0.14.0"
 # Temporary file
 tempfile = "3.3.0"
 # CLI args parser
-clap = { version = "4.0.29", features = ["derive"] }
+clap = { version = "4.0.32", features = ["derive"] }
 # Indexed hashmap
 indexmap = "1.9.2"
 
