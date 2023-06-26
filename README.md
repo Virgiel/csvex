@@ -1,3 +1,5 @@
+**Replaced by [dtex](https://github.com/Virgiel/dtex)**
+
 # CSV Explorer
 
 `csvex` is a command line CSV explorer
